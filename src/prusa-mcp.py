@@ -1,11 +1,12 @@
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP  # type: ignore
+from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
 from playwright.async_api import TimeoutError as PWTimeoutError
 from playwright.async_api import async_playwright  # type: ignore[import-not-found]
 
@@ -43,7 +44,7 @@ async def _open_context():
     """
     p = await async_playwright().start()
     browser = await p.chromium.launch(headless=HEADLESS)
-    storage_state = STATE_FILE if os.path.exists(STATE_FILE) else None
+    storage_state = STATE_FILE if Path(STATE_FILE).exists() else None
     context = await browser.new_context(storage_state=storage_state)
     if ENABLE_TRACING:
         await context.tracing.start(screenshots=True, snapshots=True, sources=True)
@@ -96,9 +97,7 @@ async def ensure_login(email: str | None, password: str | None) -> None:
     # Need credentials to proceed
     if not email or not password:
         await _close_context(p, browser, context, save_state=False)
-        raise RuntimeError(
-            "No valid session found and no credentials provided. Supply email & password once via connect_login."
-        )
+        raise RuntimeError
 
     # Attempt a robust login:
     try:
@@ -129,9 +128,7 @@ async def ensure_login(email: str | None, password: str | None) -> None:
                 continue
 
         if not clicked:
-            raise RuntimeError(
-                "Could not find 'Log in or Sign up' button on landing page"
-            )
+            raise RuntimeError
 
         # Step 2: Wait for login form/modal to appear
         await page.wait_for_timeout(1500)  # Give the modal/form time to render
@@ -163,7 +160,7 @@ async def ensure_login(email: str | None, password: str | None) -> None:
                 pass
 
         if email_field is None:
-            raise RuntimeError("Could not find email input field on login page")
+            raise RuntimeError
 
         # Try multiple selectors for password field
         password_selectors = [
@@ -188,7 +185,7 @@ async def ensure_login(email: str | None, password: str | None) -> None:
                 pass
 
         if password_field is None:
-            raise RuntimeError("Could not find password input field on login page")
+            raise RuntimeError
 
         # Fill in credentials
         await email_field.fill(email)
@@ -230,11 +227,9 @@ async def ensure_login(email: str | None, password: str | None) -> None:
         await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
 
         if not await _looks_logged_in():
-            raise RuntimeError(
-                "Login did not appear to succeed — check credentials or 2FA."
-            )
+            raise RuntimeError
     except PWTimeoutError as e:
-        raise RuntimeError(f"Timed out during login flow: {e}") from e
+        raise RuntimeError from e
     finally:
         await _close_context(p, browser, context)
 
@@ -244,11 +239,11 @@ def _get_session_cookies() -> dict[str, str]:
     Extract cookies from the stored session state file.
     Returns a dict suitable for httpx requests.
     """
-    if not os.path.exists(STATE_FILE):
+    if not Path(STATE_FILE).exists():
         return {}
 
     try:
-        with open(STATE_FILE) as f:
+        with Path(STATE_FILE).open() as f:
             state = json.load(f)
 
         cookies = {}
