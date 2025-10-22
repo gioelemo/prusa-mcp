@@ -285,6 +285,45 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
             return None
 
 
+@mcp.tool()
+async def get_printer_files(printer_uuid: str, limit: int = 100) -> str:
+    """Get list of files for a given printer UUID.
+
+    Args:
+        printer_uuid: UUID of the printer to query.
+        limit: optional limit for the API (not all endpoints support it).
+    """
+    endpoint = f"/printers/{printer_uuid}/files?limit={limit}"
+    data = await make_prusa_request(endpoint)
+
+    if not data:
+        return f"Unable to fetch files for printer {printer_uuid}."
+
+    files = data.get("files") or []
+    if not files:
+        return "No files found for this printer."
+
+    lines: list[str] = []
+    for f in files:
+        name = f.get("display_name") or f.get("name")
+        size = f.get("size")
+        mtime = f.get("m_timestamp")
+        ftype = f.get("type")
+        path = f.get("display_path") or f.get("path")
+
+        # Try to extract some meta info when present
+        meta = f.get("meta") or {}
+        est = meta.get("estimated_printing_time_normal_mode") or meta.get(
+            "estimated_print_time"
+        )
+
+        lines.append(
+            f"{name} ({ftype}) - {path} - size={size} bytes - mtime={mtime} - est={est}"
+        )
+
+    return "\n".join(lines)
+
+
 def format_printer(printer: dict) -> str:
     """Format a printer object into a readable string."""
     status = f"""
