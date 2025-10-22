@@ -488,14 +488,69 @@ async def get_printer_jobs(printer_uuid: str, limit: int = 5) -> str:
 
     formatted_jobs = []
     for job in jobs:
+        # Basic job fields
+        job_id = job.get("id", "Unknown")
+        file_name = job.get("display_name") or job.get("file_name") or "Unknown"
+        status = job.get("status") or job.get("state") or "Unknown"
+        started = job.get("started_at") or job.get("start") or "Unknown"
+        completed = job.get("completed_at") or "N/A"
+        progress = job.get("progress", "N/A")
+
+        # Prefer `preview_url` if provided by the API; otherwise try other common fields
+        file_obj = job.get("file") or {}
+        preview = (
+            job.get("preview_url")
+            or job.get("display_path")
+            or job.get("display_url")
+            or file_obj.get("preview_url")
+            or file_obj.get("display_path")
+            or file_obj.get("display_url")
+            or job.get("thumbnail")
+            or job.get("preview")
+        )
+
+        # Normalize preview to a full absolute URL.
+        # Cases handled:
+        # - full http/https URLs: keep as-is
+        # - protocol-relative URLs (//...): prefix with https:
+        # - paths starting with /app: use PRUSA_API_BASE to avoid duplicating /app
+        # - other paths starting with /: prefix with CONNECT_URL
+        # - relative paths: prefix with CONNECT_URL
+        if preview:
+            try:
+                p = str(preview).strip()
+                # already absolute
+                if p.startswith(("http://", "https://")):
+                    preview = p
+                elif p.startswith("//"):
+                    preview = "https:" + p
+                elif p.startswith("/app"):
+                    # PRUSA_API_BASE already contains '/app'
+                    preview = PRUSA_API_BASE.rstrip("/") + p[len("/app") :]
+                elif p.startswith("/"):
+                    preview = CONNECT_URL.rstrip("/") + p
+                else:
+                    # generic relative path
+                    preview = CONNECT_URL.rstrip("/") + "/" + p.lstrip("/")
+            except Exception:
+                # If normalization fails for any reason, leave preview unchanged
+                pass
+
+        if preview:
+            preview_line = f'Preview URL: {preview}\n<img src="{preview}" alt="preview" width="320"/>'
+        else:
+            preview_line = "Preview: N/A"
+
         job_info = f"""
-Job ID: {job.get("id", "Unknown")}
-File: {job.get("display_name", job.get("file_name", "Unknown"))}
-Status: {job.get("status", job.get("state", "Unknown"))}
-Started: {job.get("started_at", job.get("start", "Unknown"))}
-Completed: {job.get("completed_at", "N/A")}
-Progress: {job.get("progress", "N/A")}%
+Job ID: {job_id}
+File: {file_name}
+Status: {status}
+Started: {started}
+Completed: {completed}
+Progress: {progress}%
+{preview_line}
 """
+
         formatted_jobs.append(job_info)
 
     return "\n---\n".join(formatted_jobs)
