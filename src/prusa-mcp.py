@@ -1,11 +1,13 @@
-from typing import Any, Optional
-import httpx
-import os
 import json
-from mcp.server.fastmcp import FastMCP  # type: ignore
-from dotenv import load_dotenv
 import logging
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError  # type: ignore[import-not-found]
+import os
+from typing import Any
+
+import httpx
+from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP  # type: ignore
+from playwright.async_api import TimeoutError as PWTimeoutError
+from playwright.async_api import async_playwright  # type: ignore[import-not-found]
 
 # Load environment variables from .env file
 load_dotenv()
@@ -65,7 +67,7 @@ async def _close_context(p, browser, context, *, save_state=True):
 # ----------------------------
 # Core login flow
 # ----------------------------
-async def ensure_login(email: Optional[str], password: Optional[str]) -> None:
+async def ensure_login(email: str | None, password: str | None) -> None:
     """
     Navigate to Connect, and if not already authenticated, perform the login flow.
     - If STATE_FILE already contains a valid session, this is a no-op.
@@ -246,7 +248,7 @@ def _get_session_cookies() -> dict[str, str]:
         return {}
 
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE) as f:
             state = json.load(f)
 
         cookies = {}
@@ -255,7 +257,7 @@ def _get_session_cookies() -> dict[str, str]:
 
         return cookies
     except Exception as e:
-        logging.error(f"Failed to read session cookies: {e}")
+        logging.exception(f"Failed to read session cookies: {e}")
         return {}
 
 
@@ -282,7 +284,7 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logging.error(f"API request failed: {e}")
+            logging.exception(f"API request failed: {e}")
             return None
 
 
@@ -337,8 +339,8 @@ async def connect_login(email: str = "", password: str = "") -> str:
         await ensure_login(login_email, login_password)
         return f"Successfully logged in and session saved to {STATE_FILE}"
     except Exception as e:
-        logging.error(f"Login failed: {e}")
-        return f"Login failed: {str(e)}"
+        logging.exception(f"Login failed: {e}")
+        return f"Login failed: {e!s}"
 
 
 @mcp.tool()
