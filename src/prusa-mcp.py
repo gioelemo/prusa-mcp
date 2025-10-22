@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ load_dotenv()
 
 # Initialize FastMCP server
 mcp = FastMCP("prusa-printer")
+logger = logging.getLogger(__name__)
+
 
 # Constants
 PRUSA_API_BASE = "https://connect.prusa3d.com/app"
@@ -154,10 +157,8 @@ async def ensure_login(email: str | None, password: str | None) -> None:
 
         if email_field is None:
             # Try label-based approach
-            try:
+            with suppress(Exception):
                 email_field = page.get_by_label("Email", exact=False).first
-            except Exception:
-                pass
 
         if email_field is None:
             raise RuntimeError
@@ -179,10 +180,8 @@ async def ensure_login(email: str | None, password: str | None) -> None:
                 continue
 
         if password_field is None:
-            try:
+            with suppress(Exception):
                 password_field = page.get_by_label("Password", exact=False).first
-            except Exception:
-                pass
 
         if password_field is None:
             raise RuntimeError
@@ -249,11 +248,11 @@ def _get_session_cookies() -> dict[str, str]:
         cookies = {}
         for cookie in state.get("cookies", []):
             cookies[cookie["name"]] = cookie["value"]
-
-        return cookies
-    except Exception as e:
-        logging.exception(f"Failed to read session cookies: {e}")
+    except Exception:
+        logger.exception("Failed to read session cookies")
         return {}
+    else:
+        return cookies
 
 
 async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
@@ -264,7 +263,7 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
     cookies = _get_session_cookies()
 
     if not cookies:
-        logging.error(
+        logger.error(
             "No session cookies found. Please log in first using connect_login."
         )
         return None
@@ -278,8 +277,8 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
             response = await client.get(url, headers=headers, timeout=30.0)
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            logging.exception(f"API request failed: {e}")
+        except Exception:
+            logger.exception("API request failed")
             return None
 
 
@@ -332,10 +331,11 @@ async def connect_login(email: str = "", password: str = "") -> str:
             return "Error: Email and password must be provided either as arguments or via PRUSA_EMAIL and PRUSA_PASSWORD environment variables."
 
         await ensure_login(login_email, login_password)
-        return f"Successfully logged in and session saved to {STATE_FILE}"
     except Exception as e:
-        logging.exception(f"Login failed: {e}")
+        logger.exception("Login failed")
         return f"Login failed: {e!s}"
+    else:
+        return f"Successfully logged in and session saved to {STATE_FILE}"
 
 
 @mcp.tool()
@@ -352,7 +352,7 @@ async def get_printers(limit: int = 10) -> str:
         return "Unable to fetch printer data."
 
     printers = data.get("printers", [])  # Changed from "data" to "printers"
-    logging.info(data)
+    logger.info(data)
 
     if not printers:
         return "No printers found."
