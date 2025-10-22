@@ -324,6 +324,39 @@ async def get_printer_files(printer_uuid: str, limit: int = 100) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def get_printer_storages(printer_uuid: str) -> str:
+    """Get storage devices for a given printer UUID.
+
+    Args:
+        printer_uuid: UUID of the printer to query.
+    """
+    endpoint = f"/printers/{printer_uuid}/storages"
+    data = await make_prusa_request(endpoint)
+
+    if not data:
+        return f"Unable to fetch storages for printer {printer_uuid}."
+
+    storages = data.get("storages") or []
+    if not storages:
+        return "No storages found for this printer."
+
+    lines: list[str] = []
+    for s in storages:
+        name = s.get("name")
+        mount = s.get("mountpoint")
+        free = s.get("free_space")
+        fcount = s.get("file_count")
+        stype = s.get("type")
+        ro = s.get("read_only")
+
+        lines.append(
+            f"{name} ({stype}) mounted at {mount} - free={free} bytes - files={fcount} - read_only={ro}"
+        )
+
+    return "\n".join(lines)
+
+
 def format_printer(printer: dict) -> str:
     """Format a printer object into a readable string."""
     status = f"""
@@ -466,6 +499,56 @@ Progress: {job.get("progress", "N/A")}%
         formatted_jobs.append(job_info)
 
     return "\n---\n".join(formatted_jobs)
+
+
+@mcp.tool()
+async def get_printer_events(printer_uuid: str, limit: int = 100) -> str:
+    """Fetch recent events for the given printer UUID and format them.
+
+    Args:
+        printer_uuid: Printer UUID
+        limit: Maximum number of events to fetch
+    """
+    endpoint = f"/printers/{printer_uuid}/events?limit={limit}"
+    data = await make_prusa_request(endpoint)
+
+    if not data:
+        return f"Unable to fetch events for printer {printer_uuid}."
+
+    events = data.get("events") or []
+    if not events:
+        return "No recent events found for this printer."
+
+    lines: list[str] = []
+    for e in events:
+        evt = e.get("event")
+        state = e.get("state")
+        source = e.get("source")
+        created = e.get("created")
+        server_time = e.get("server_time")
+        data_field = e.get("data")
+
+        # Short representation of data if present
+        data_repr = None
+        if isinstance(data_field, dict):
+            # pick a few keys to show
+            keys = [
+                k
+                for k in ("target_nozzle", "target_bed", "path", "size")
+                if k in data_field
+            ]
+            if keys:
+                data_repr = ", ".join(f"{k}={data_field[k]}" for k in keys)
+            else:
+                data_repr = json.dumps(data_field)
+
+        line = f"{evt} - {state} - source={source} - created={created} - server_time={server_time}"
+        if data_repr:
+            line += f" - data: {data_repr}"
+
+        lines.append(line)
+
+    return "\n".join(lines)
 
 
 def main():
