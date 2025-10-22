@@ -357,6 +357,71 @@ async def get_printer_storages(printer_uuid: str) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def send_printer_command(
+    printer_uuid: str, command: str, args: dict[str, Any] | None = None
+) -> str:
+    """Send a command to a specific printer.
+
+    Args:
+        printer_uuid: The UUID of the printer
+        command: Command name (e.g., "PAUSE_PRINT", "RESUME_PRINT", "SET_PRINTER_READY")
+        args: Optional dictionary of command arguments
+
+    Common Commands:
+        - PAUSE_PRINT: Pause the current print
+        - RESUME_PRINT: Resume a paused print
+        - STOP_PRINT: Stop/cancel the current print
+        - SET_PRINTER_READY: Mark printer as ready
+        - CANCEL_PRINTER_READY: Unmark printer as ready
+        - START_PRINT: Start a print (requires args: {"path": "/path/to/file.gcode"})
+        - BEEP: Make the printer beep
+        - RESET_PRINTER: Reset the printer
+        - SET_NOZZLE_TEMPERATURE: Set nozzle temp (args: {"nozzle_temperature": 210})
+        - SET_HEATBED_TEMPERATURE: Set bed temp (args: {"bed_temperature": 60})
+        - LOAD_FILAMENT: Load filament (optional args: {"filament": "PLA"})
+        - UNLOAD_FILAMENT: Unload filament
+    """
+    endpoint = f"/printers/{printer_uuid}/commands"
+
+    # Build command payload
+    payload: dict[str, Any] = {"command": command}
+
+    # Add args if provided
+    if args:
+        payload["args"] = args
+
+    try:
+        cookies = _get_session_cookies()
+        async with httpx.AsyncClient(cookies=cookies, timeout=30.0) as client:
+            url = f"{PRUSA_API_BASE}{endpoint}"
+
+            logger.info(f"Sending command to {url}: {payload}")
+
+            response = await client.post(
+                url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+
+            response.raise_for_status()
+            result = response.json()
+
+            return f"Command '{command}' sent successfully to printer {printer_uuid}.\nResponse: {json.dumps(result, indent=2)}"
+
+    except httpx.HTTPStatusError as e:
+        logger.exception("HTTP error sending command")
+        return (
+            f"Failed to send command: HTTP {e.response.status_code} - {e.response.text}"
+        )
+    except Exception as e:
+        logger.exception("Error sending command")
+        return f"Error sending command: {e!s}"
+
+
 def format_printer(printer: dict) -> str:
     """Format a printer object into a readable string."""
     status = f"""
