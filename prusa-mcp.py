@@ -1,9 +1,11 @@
-from typing import Any
+from typing import Any, Optional
 import httpx
 import os
-from mcp.server.fastmcp import FastMCP # type: ignore
+import json
+from mcp.server.fastmcp import FastMCP  # type: ignore
 from dotenv import load_dotenv
 import logging
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError  # type: ignore[import-not-found]
 
 # Load environment variables from .env file
 load_dotenv()
@@ -13,23 +15,268 @@ mcp = FastMCP("prusa-printer")
 
 # Constants
 PRUSA_API_BASE = "https://connect.prusa3d.com/app"
-ACCESS_TOKEN = os.getenv("PRUSA_ACCESS_TOKEN")
+CONNECT_URL = os.environ.get("PRUSA_CONNECT_URL", "https://connect.prusa3d.com")
 
-if not ACCESS_TOKEN:
-    raise ValueError(
-        "PRUSA_ACCESS_TOKEN not found in environment variables. Please add it to your .env file."
-    )
+# Where we persist session cookies (storage_state). Keep this private!
+STATE_FILE = os.environ.get("PRUSA_CONNECT_STATE", "connect_state.json")
+
+# Headless by default; set HEADLESS=0 to watch the browser
+HEADLESS = os.environ.get("HEADLESS", "1") != "0"
+
+# Optional: Enable Playwright tracing for debugging (stores trace.zip)
+ENABLE_TRACING = os.environ.get("PW_TRACING", "0") == "1"
+
+# Reasonable default timeouts (ms)
+NAV_TIMEOUT = int(os.environ.get("PW_NAV_TIMEOUT_MS", "30000"))
+SEL_TIMEOUT = int(os.environ.get("PW_SEL_TIMEOUT_MS", "15000"))
+
+
+# ----------------------------
+# Utility: open a browser context
+# ----------------------------
+async def _open_context():
+    """
+    Launch Chromium and return (playwright, browser, context).
+    If STATE_FILE exists, we reuse it (keeps you logged in).
+    """
+    p = await async_playwright().start()
+    browser = await p.chromium.launch(headless=HEADLESS)
+    storage_state = STATE_FILE if os.path.exists(STATE_FILE) else None
+    context = await browser.new_context(storage_state=storage_state)
+    if ENABLE_TRACING:
+        await context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    return p, browser, context
+
+
+async def _close_context(p, browser, context, *, save_state=True):
+    """
+    Optionally save storage_state for persistent sessions.
+    """
+    try:
+        if ENABLE_TRACING:
+            await context.tracing.stop(path="trace.zip")
+        if save_state:
+            await context.storage_state(path=STATE_FILE)
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+# ----------------------------
+# Core login flow
+# ----------------------------
+async def ensure_login(email: Optional[str], password: Optional[str]) -> None:
+    """
+    Navigate to Connect, and if not already authenticated, perform the login flow.
+    - If STATE_FILE already contains a valid session, this is a no-op.
+    - Otherwise, we require email+password to log in.
+    """
+    p, browser, context = await _open_context()
+    page = await context.new_page()
+    page.set_default_navigation_timeout(NAV_TIMEOUT)
+    await page.goto(CONNECT_URL, wait_until="domcontentloaded")
+
+    async def _looks_logged_in() -> bool:
+        # Heuristic: if the page redirects to a dashboard with nav, or lacks sign-in UI.
+        content = await page.content()
+        title = await page.title()
+        return (
+            "Sign in" not in content
+            and "Log in" not in content
+            and "Sign in" not in title
+            and "Log in" not in title
+        )
+
+    if await _looks_logged_in():
+        await _close_context(p, browser, context)  # Already logged-in via STATE_FILE
+        return
+
+    # Need credentials to proceed
+    if not email or not password:
+        await _close_context(p, browser, context, save_state=False)
+        raise RuntimeError(
+            "No valid session found and no credentials provided. Supply email & password once via connect_login."
+        )
+
+    # Attempt a robust login:
+    try:
+        # Step 1: Click the "Log in or Sign up" button on the landing page
+        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_timeout(1000)  # Give the page time to render
+
+        # Look for the "Log in or Sign up" button
+        login_button_selectors = [
+            "text='Log in or Sign up'",
+            "text='Log in'",
+            "text='Sign in'",
+            "button:has-text('Log in')",
+            "button:has-text('Sign up')",
+            "a:has-text('Log in')",
+            "a:has-text('Sign up')",
+        ]
+
+        clicked = False
+        for selector in login_button_selectors:
+            try:
+                button = page.locator(selector).first
+                if await button.is_visible(timeout=2000):
+                    await button.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            raise RuntimeError(
+                "Could not find 'Log in or Sign up' button on landing page"
+            )
+
+        # Step 2: Wait for login form/modal to appear
+        await page.wait_for_timeout(1500)  # Give the modal/form time to render
+
+        # Try multiple selectors for email field
+        email_selectors = [
+            "input[type='email']",
+            "input[name='email']",
+            "input[name='username']",
+            "input[id='email']",
+            "input[placeholder*='mail' i]",
+            "input[placeholder*='username' i]",
+        ]
+
+        email_field = None
+        for selector in email_selectors:
+            try:
+                email_field = page.locator(selector).first
+                if await email_field.is_visible(timeout=2000):
+                    break
+            except Exception:
+                continue
+
+        if email_field is None:
+            # Try label-based approach
+            try:
+                email_field = page.get_by_label("Email", exact=False).first
+            except Exception:
+                pass
+
+        if email_field is None:
+            raise RuntimeError("Could not find email input field on login page")
+
+        # Try multiple selectors for password field
+        password_selectors = [
+            "input[type='password']",
+            "input[name='password']",
+            "input[id='password']",
+        ]
+
+        password_field = None
+        for selector in password_selectors:
+            try:
+                password_field = page.locator(selector).first
+                if await password_field.is_visible(timeout=2000):
+                    break
+            except Exception:
+                continue
+
+        if password_field is None:
+            try:
+                password_field = page.get_by_label("Password", exact=False).first
+            except Exception:
+                pass
+
+        if password_field is None:
+            raise RuntimeError("Could not find password input field on login page")
+
+        # Fill in credentials
+        await email_field.fill(email)
+        await password_field.fill(password)
+
+        # Give fields time to register (some sites check on blur)
+        await page.wait_for_timeout(500)
+
+        # Find and click the submit button - try multiple approaches
+        submit_button = None
+        button_selectors = [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('Sign in')",
+            "button:has-text('Log in')",
+            "button:has-text('Login')",
+            "button:has-text('Continue')",
+            "form button",
+        ]
+
+        for selector in button_selectors:
+            try:
+                submit_button = page.locator(selector).first
+                if await submit_button.is_visible(timeout=1000):
+                    await submit_button.click()
+                    break
+            except Exception:
+                continue
+
+        if submit_button is None:
+            # Last resort: try role-based
+            try:
+                await page.get_by_role("button").first.click()
+            except Exception:
+                # Or just press Enter on the password field
+                await password_field.press("Enter")
+
+        # Wait until network idle meaning post-login redirects have settled
+        await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+
+        if not await _looks_logged_in():
+            raise RuntimeError(
+                "Login did not appear to succeed — check credentials or 2FA."
+            )
+    except PWTimeoutError as e:
+        raise RuntimeError(f"Timed out during login flow: {e}") from e
+    finally:
+        await _close_context(p, browser, context)
+
+
+def _get_session_cookies() -> dict[str, str]:
+    """
+    Extract cookies from the stored session state file.
+    Returns a dict suitable for httpx requests.
+    """
+    if not os.path.exists(STATE_FILE):
+        return {}
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+
+        cookies = {}
+        for cookie in state.get("cookies", []):
+            cookies[cookie["name"]] = cookie["value"]
+
+        return cookies
+    except Exception as e:
+        logging.error(f"Failed to read session cookies: {e}")
+        return {}
 
 
 async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
-    """Make a request to the Prusa Connect API with proper error handling."""
+    """Make a request to the Prusa Connect API using session cookies."""
     url = f"{PRUSA_API_BASE}{endpoint}"
+
+    # Get cookies from stored session
+    cookies = _get_session_cookies()
+
+    if not cookies:
+        logging.error(
+            "No session cookies found. Please log in first using connect_login."
+        )
+        return None
+
     headers = {
         "Accept": "application/json",
-        "Cookie": f"auth.access_token={ACCESS_TOKEN}",
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(cookies=cookies) as client:
         try:
             response = await client.get(url, headers=headers, timeout=30.0)
             response.raise_for_status()
@@ -69,6 +316,29 @@ Time Remaining: {job.get("time_remaining", 0)} seconds
 """
 
     return status
+
+
+@mcp.tool()
+async def connect_login(email: str = "", password: str = "") -> str:
+    """Log in to Prusa Connect and persist session cookies to reuse later.
+
+    Args:
+        email: Prusa Connect email / username (optional if set in environment as PRUSA_EMAIL)
+        password: Prusa Connect password (optional if set in environment as PRUSA_PASSWORD)
+    """
+    try:
+        # Use provided credentials or fall back to environment variables
+        login_email = email or os.getenv("PRUSA_EMAIL")
+        login_password = password or os.getenv("PRUSA_PASSWORD")
+
+        if not login_email or not login_password:
+            return "Error: Email and password must be provided either as arguments or via PRUSA_EMAIL and PRUSA_PASSWORD environment variables."
+
+        await ensure_login(login_email, login_password)
+        return f"Successfully logged in and session saved to {STATE_FILE}"
+    except Exception as e:
+        logging.error(f"Login failed: {e}")
+        return f"Login failed: {str(e)}"
 
 
 @mcp.tool()
