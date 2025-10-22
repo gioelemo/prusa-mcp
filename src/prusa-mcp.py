@@ -82,155 +82,158 @@ async def ensure_login(email: str | None, password: str | None) -> None:
     page.set_default_navigation_timeout(NAV_TIMEOUT)
     await page.goto(CONNECT_URL, wait_until="domcontentloaded")
 
-    async def _looks_logged_in() -> bool:
-        # Heuristic: if the page redirects to a dashboard with nav, or lacks sign-in UI.
-        content = await page.content()
-        title = await page.title()
-        return (
-            "Sign in" not in content
-            and "Log in" not in content
-            and "Sign in" not in title
-            and "Log in" not in title
-        )
-
-    if await _looks_logged_in():
-        await _close_context(p, browser, context)  # Already logged-in via STATE_FILE
+    if await _is_already_logged_in(page):
+        await _close_context(p, browser, context)
         return
 
-    # Need credentials to proceed
     if not email or not password:
         await _close_context(p, browser, context, save_state=False)
         raise RuntimeError
 
-    # Attempt a robust login:
     try:
-        # Step 1: Click the "Log in or Sign up" button on the landing page
-        await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_timeout(1000)  # Give the page time to render
+        await _perform_login(page, email, password)
 
-        # Look for the "Log in or Sign up" button
-        login_button_selectors = [
-            "text='Log in or Sign up'",
-            "text='Log in'",
-            "text='Sign in'",
-            "button:has-text('Log in')",
-            "button:has-text('Sign up')",
-            "a:has-text('Log in')",
-            "a:has-text('Sign up')",
-        ]
-
-        clicked = False
-        for selector in login_button_selectors:
-            try:
-                button = page.locator(selector).first
-                if await button.is_visible(timeout=2000):
-                    await button.click()
-                    clicked = True
-                    break
-            except Exception:
-                continue
-
-        if not clicked:
-            raise RuntimeError
-
-        # Step 2: Wait for login form/modal to appear
-        await page.wait_for_timeout(1500)  # Give the modal/form time to render
-
-        # Try multiple selectors for email field
-        email_selectors = [
-            "input[type='email']",
-            "input[name='email']",
-            "input[name='username']",
-            "input[id='email']",
-            "input[placeholder*='mail' i]",
-            "input[placeholder*='username' i]",
-        ]
-
-        email_field = None
-        for selector in email_selectors:
-            try:
-                email_field = page.locator(selector).first
-                if await email_field.is_visible(timeout=2000):
-                    break
-            except Exception:
-                continue
-
-        if email_field is None:
-            # Try label-based approach
-            with suppress(Exception):
-                email_field = page.get_by_label("Email", exact=False).first
-
-        if email_field is None:
-            raise RuntimeError
-
-        # Try multiple selectors for password field
-        password_selectors = [
-            "input[type='password']",
-            "input[name='password']",
-            "input[id='password']",
-        ]
-
-        password_field = None
-        for selector in password_selectors:
-            try:
-                password_field = page.locator(selector).first
-                if await password_field.is_visible(timeout=2000):
-                    break
-            except Exception:
-                continue
-
-        if password_field is None:
-            with suppress(Exception):
-                password_field = page.get_by_label("Password", exact=False).first
-
-        if password_field is None:
-            raise RuntimeError
-
-        # Fill in credentials
-        await email_field.fill(email)
-        await password_field.fill(password)
-
-        # Give fields time to register (some sites check on blur)
-        await page.wait_for_timeout(500)
-
-        # Find and click the submit button - try multiple approaches
-        submit_button = None
-        button_selectors = [
-            "button[type='submit']",
-            "input[type='submit']",
-            "button:has-text('Sign in')",
-            "button:has-text('Log in')",
-            "button:has-text('Login')",
-            "button:has-text('Continue')",
-            "form button",
-        ]
-
-        for selector in button_selectors:
-            try:
-                submit_button = page.locator(selector).first
-                if await submit_button.is_visible(timeout=1000):
-                    await submit_button.click()
-                    break
-            except Exception:
-                continue
-
-        if submit_button is None:
-            # Last resort: try role-based
-            try:
-                await page.get_by_role("button").first.click()
-            except Exception:
-                # Or just press Enter on the password field
-                await password_field.press("Enter")
-
-        # Wait until network idle meaning post-login redirects have settled
-        await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
-
-        if not await _looks_logged_in():
+        if not await _is_already_logged_in(page):
             raise RuntimeError
     except PWTimeoutError as e:
         raise RuntimeError from e
     finally:
         await _close_context(p, browser, context)
+
+
+async def _is_already_logged_in(page) -> bool:
+    """Check if user is already authenticated."""
+    content = await page.content()
+    title = await page.title()
+    return (
+        "Sign in" not in content
+        and "Log in" not in content
+        and "Sign in" not in title
+        and "Log in" not in title
+    )
+
+
+async def _perform_login(page, email: str, password: str) -> None:
+    """Execute the complete login flow."""
+    await _click_login_button(page)
+    await page.wait_for_timeout(1500)  # Give the modal/form time to render
+
+    email_field = await _find_email_field(page)
+    password_field = await _find_password_field(page)
+
+    await email_field.fill(email)
+    await password_field.fill(password)
+    await page.wait_for_timeout(500)  # Let fields register
+
+    await _submit_login_form(page, password_field)
+    await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+
+
+async def _click_login_button(page) -> None:
+    """Find and click the login button on the landing page."""
+    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_timeout(1000)
+
+    login_button_selectors = [
+        "text='Log in or Sign up'",
+        "text='Log in'",
+        "text='Sign in'",
+        "button:has-text('Log in')",
+        "button:has-text('Sign up')",
+        "a:has-text('Log in')",
+        "a:has-text('Sign up')",
+    ]
+
+    if not await _try_click_selectors(page, login_button_selectors):
+        raise RuntimeError
+
+
+async def _find_email_field(page):
+    """Locate the email input field."""
+    email_selectors = [
+        "input[type='email']",
+        "input[name='email']",
+        "input[name='username']",
+        "input[id='email']",
+        "input[placeholder*='mail' i]",
+        "input[placeholder*='username' i]",
+    ]
+
+    field = await _try_find_field(page, email_selectors)
+    if field is None:
+        with suppress(Exception):
+            field = page.get_by_label("Email", exact=False).first
+
+    if field is None:
+        raise RuntimeError
+
+    return field
+
+
+async def _find_password_field(page):
+    """Locate the password input field."""
+    password_selectors = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[id='password']",
+    ]
+
+    field = await _try_find_field(page, password_selectors)
+    if field is None:
+        with suppress(Exception):
+            field = page.get_by_label("Password", exact=False).first
+
+    if field is None:
+        raise RuntimeError
+
+    return field
+
+
+async def _submit_login_form(page, password_field) -> None:
+    """Find and click the submit button, or press Enter as fallback."""
+    button_selectors = [
+        "button[type='submit']",
+        "input[type='submit']",
+        "button:has-text('Sign in')",
+        "button:has-text('Log in')",
+        "button:has-text('Login')",
+        "button:has-text('Continue')",
+        "form button",
+    ]
+
+    if await _try_click_selectors(page, button_selectors):
+        return
+
+    # Fallback strategies
+    try:
+        await page.get_by_role("button").first.click()
+    except Exception:
+        await password_field.press("Enter")
+
+
+async def _try_click_selectors(page, selectors: list[str]) -> bool:
+    """Try clicking elements matching the given selectors. Returns True if successful."""
+    for selector in selectors:
+        try:
+            element = page.locator(selector).first
+            if await element.is_visible(timeout=2000):
+                await element.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _try_find_field(page, selectors: list[str]):
+    """Try finding a field matching the given selectors. Returns None if not found."""
+    for selector in selectors:
+        try:
+            field = page.locator(selector).first
+            if await field.is_visible(timeout=2000):
+                return field
+        except Exception:
+            continue
+    return None
 
 
 def _get_session_cookies() -> dict[str, str]:
