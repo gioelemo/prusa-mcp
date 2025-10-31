@@ -35,6 +35,22 @@ The server uses the following environment variables (optional):
 You can create a `.env` file to set these variables.
 
 ## Usage
+Settings for Claude Desktop to be placed in `claude_desktop_config.json`
+```
+{
+  "mcpServers": {
+    "prusa-mcp": {
+      "command": "/Users/gioelemolinari/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Users/gioelemolinari/Desktop/prusa-mcp",
+        "run",
+        "src/prusa-mcp.py"
+      ]
+    }
+  }
+}
+```
 
 ### Available Tools
 
