@@ -601,11 +601,7 @@ async def get_printer_jobs(printer_uuid: str, limit: int = 5) -> str:
                 # If normalization fails for any reason, leave preview unchanged
                 pass
 
-        if preview:
-            preview_line = f'Preview URL: {preview}\n<img src="{preview}" alt="preview" width="320"/>'
-        else:
-            preview_line = "Preview: N/A"
-
+        # Don't include preview in output as it doesn't render properly in Streamlit
         job_info = f"""
 Job ID: {job_id}
 File: {file_name}
@@ -613,7 +609,6 @@ Status: {status}
 Started: {started}
 Completed: {completed}
 Progress: {progress}%
-{preview_line}
 """
 
         formatted_jobs.append(job_info)
