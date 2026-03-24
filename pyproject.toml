@@ -1,7 +1,7 @@
 [project]
 name = "prusa-mcp"
 version = "0.1.0"
-description = "Small Prusa MCP Server"
+description = "MCP server for controlling Prusa 3D printers via Prusa Connect"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "GPL-3.0"}
