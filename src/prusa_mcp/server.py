@@ -476,7 +476,7 @@ async def get_printers(limit: int = 10) -> str:
     if not data:
         return "Unable to fetch printer data."
 
-    printers = data.get("printers", [])  # Changed from "data" to "printers"
+    printers = data.get("printers", [])
     logger.info(data)
 
     if not printers:
