@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Small Prusa MCP Server"
 readme = "README.md"
 requires-python = ">=3.12"
+license = {text = "GPL-3.0"}
 authors = [
     {name = "Gioele Molinari", email = "gioelemo@ethz.ch"}
 ]
@@ -100,6 +101,7 @@ ignore = [
     "E501",  # line too long, handled by black
     "B008",  # do not perform function calls in argument defaults
     "C901",  # too complex
+    "TRY003", # allow descriptive messages in exception raises
     "W191",  # indentation contains tabs
     "D100",  # Missing docstring in public module
     "D101",  # Missing docstring in public class
