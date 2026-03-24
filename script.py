@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 
 def state_to_cookie_header(state_path="connect_state.json"):
