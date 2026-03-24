@@ -1,13 +1,17 @@
 # prusa-mcp
-Small Prusa MCP Server
 
-## Overview
-MCP server that provides tools to interact with Prusa Connect via username/password authentication using Playwright browser automation.
+[![pre-commit](https://github.com/gioelemo/prusa-mcp/actions/workflows/pre-commit.yaml/badge.svg)](https://github.com/gioelemo/prusa-mcp/actions/workflows/pre-commit.yaml)
+
+MCP server for interacting with Prusa Connect via session-based authentication using Playwright browser automation.
 
 ## Features
+
 - **Session-based Authentication**: Log in once with username and password, session cookies are persisted for future use
 - **Printer Management**: List all printers and get detailed status information
 - **Job Tracking**: View recent print jobs for specific printers
+- **File & Storage Management**: Browse printer files and storage devices
+- **Printer Commands**: Send commands directly to printers (pause, resume, temperature, etc.)
+- **Event Monitoring**: Fetch recent printer events
 
 ## Installation
 
@@ -25,80 +29,113 @@ uv run playwright install chromium
 
 The server uses the following environment variables (optional):
 
-- `PRUSA_CONNECT_URL`: Base URL for Prusa Connect (default: `https://connect.prusa3d.com`)
-- `PRUSA_CONNECT_STATE`: Path to session state file (default: `connect_state.json`)
-- `HEADLESS`: Run browser in headless mode (default: `1`, set to `0` to watch the browser)
-- `PW_TRACING`: Enable Playwright tracing for debugging (default: `0`)
-- `PW_NAV_TIMEOUT_MS`: Navigation timeout in milliseconds (default: `30000`)
-- `PW_SEL_TIMEOUT_MS`: Selector timeout in milliseconds (default: `15000`)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PRUSA_CONNECT_URL` | `https://connect.prusa3d.com` | Base URL for Prusa Connect |
+| `PRUSA_CONNECT_STATE` | `connect_state.json` | Path to session state file |
+| `PRUSA_EMAIL` | — | Default login email |
+| `PRUSA_PASSWORD` | — | Default login password |
+| `HEADLESS` | `1` | Run browser headless (`0` to watch) |
+| `PW_TRACING` | `0` | Enable Playwright tracing |
+| `PW_NAV_TIMEOUT_MS` | `30000` | Navigation timeout (ms) |
+| `PW_SEL_TIMEOUT_MS` | `15000` | Selector timeout (ms) |
 
 You can create a `.env` file to set these variables.
 
 ## Usage
-Settings for Claude Desktop to be placed in `claude_desktop_config.json`
-```
+
+### Claude Desktop
+
+Add to your `claude_desktop_config.json`:
+```json
 {
   "mcpServers": {
     "prusa-mcp": {
-      "command": "/Users/gioelemolinari/.local/bin/uv",
+      "command": "uv",
       "args": [
         "--directory",
-        "/Users/gioelemolinari/Desktop/prusa-mcp",
+        "/path/to/prusa-mcp",
         "run",
-        "src/prusa-mcp.py"
+        "prusa-mcp"
       ]
     }
   }
 }
 ```
 
+### CLI
+
+```bash
+# Run the MCP server directly
+uv run prusa-mcp
+
+# Or via python module
+python -m prusa_mcp
+```
+
 ### Available Tools
 
-#### 1. `connect_login`
+#### `connect_login`
 Log in to Prusa Connect and save session cookies for later use.
 
-**Parameters:**
-- `email` (string): Your Prusa Connect email/username
-- `password` (string): Your Prusa Connect password
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `email` | string | No | Prusa Connect email (falls back to `PRUSA_EMAIL`) |
+| `password` | string | No | Prusa Connect password (falls back to `PRUSA_PASSWORD`) |
 
-**Example:**
-```python
-connect_login(email="your-email@example.com", password="your-password")
-```
-
-#### 2. `get_printers`
+#### `get_printers`
 Get a list of all your Prusa printers.
 
-**Parameters:**
-- `limit` (int, optional): Maximum number of printers to return (default: 10)
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `limit` | int | No | Max printers to return (default: 10) |
 
-**Example:**
-```python
-get_printers(limit=5)
-```
-
-#### 3. `get_printer_status`
+#### `get_printer_status`
 Get detailed status of a specific printer.
 
-**Parameters:**
-- `printer_uuid` (string): The UUID or name of the printer
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `printer_uuid` | string | Yes | UUID or name of the printer |
 
-**Example:**
-```python
-get_printer_status(printer_uuid="your-printer-uuid")
-```
-
-#### 4. `get_printer_jobs`
+#### `get_printer_jobs`
 Get recent jobs for a specific printer.
 
-**Parameters:**
-- `printer_uuid` (string): The UUID of the printer
-- `limit` (int, optional): Maximum number of jobs to return (default: 5)
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `printer_uuid` | string | Yes | UUID of the printer |
+| `limit` | int | No | Max jobs to return (default: 5) |
 
-**Example:**
-```python
-get_printer_jobs(printer_uuid="your-printer-uuid", limit=10)
-```
+#### `get_printer_files`
+Get list of files on a printer.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `printer_uuid` | string | Yes | UUID of the printer |
+| `limit` | int | No | Max files to return (default: 100) |
+
+#### `get_printer_storages`
+Get storage devices for a printer.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `printer_uuid` | string | Yes | UUID of the printer |
+
+#### `send_printer_command`
+Send a command to a specific printer (e.g., pause, resume, set temperature).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `printer_uuid` | string | Yes | UUID of the printer |
+| `command` | string | Yes | Command name (see [command reference](supported_command.md)) |
+| `args` | object | No | Command arguments |
+
+#### `get_printer_events`
+Fetch recent events for a printer.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `printer_uuid` | string | Yes | UUID of the printer |
+| `limit` | int | No | Max events to return (default: 100) |
 
 ## Security Notes
 
