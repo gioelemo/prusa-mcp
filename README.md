@@ -1,6 +1,9 @@
 # prusa-mcp
 
-[![pre-commit](https://github.com/gioelemo/prusa-mcp/actions/workflows/pre-commit.yaml/badge.svg)](https://github.com/gioelemo/prusa-mcp/actions/workflows/pre-commit.yaml)
+[![Python](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://pre-commit.com/)
+[![code style: Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Checked with mypy](http://www.mypy-lang.org/static/mypy_badge.svg)](http://mypy-lang.org/)
 
 MCP server for interacting with Prusa Connect via session-based authentication using Playwright browser automation.
 

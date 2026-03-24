@@ -1,15 +1,17 @@
+"""Prusa Connect MCP server — tools and login flow."""
+
+from contextlib import suppress
 import json
 import logging
 import os
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-import httpx
 from dotenv import load_dotenv
+import httpx
 from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
-from playwright.async_api import TimeoutError as PWTimeoutError
 from playwright.async_api import async_playwright  # type: ignore[import-not-found]
+from playwright.async_api import TimeoutError as PWTimeoutError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -41,13 +43,13 @@ SEL_TIMEOUT = int(os.environ.get("PW_SEL_TIMEOUT_MS", "15000"))
 # Utility: open a browser context
 # ----------------------------
 async def _open_context():
-    """
-    Launch Chromium and return (playwright, browser, context).
+    """Launch Chromium and return (playwright, browser, context).
+
     If STATE_FILE exists, we reuse it (keeps you logged in).
     """
     p = await async_playwright().start()
     browser = await p.chromium.launch(headless=HEADLESS)
-    storage_state = STATE_FILE if Path(STATE_FILE).exists() else None
+    storage_state = STATE_FILE if Path(STATE_FILE).exists() else None  # noqa: ASYNC240
     context = await browser.new_context(storage_state=storage_state)
     if ENABLE_TRACING:
         await context.tracing.start(screenshots=True, snapshots=True, sources=True)
@@ -55,9 +57,7 @@ async def _open_context():
 
 
 async def _close_context(p, browser, context, *, save_state=True):
-    """
-    Optionally save storage_state for persistent sessions.
-    """
+    """Optionally save storage_state for persistent sessions."""
     try:
         if ENABLE_TRACING:
             await context.tracing.stop(path="trace.zip")
@@ -72,8 +72,8 @@ async def _close_context(p, browser, context, *, save_state=True):
 # Core login flow
 # ----------------------------
 async def ensure_login(email: str | None, password: str | None) -> None:
-    """
-    Navigate to Connect, and if not already authenticated, perform the login flow.
+    """Navigate to Connect, and if not already authenticated, perform the login flow.
+
     - If STATE_FILE already contains a valid session, this is a no-op.
     - Otherwise, we require email+password to log in.
     """
@@ -89,18 +89,14 @@ async def ensure_login(email: str | None, password: str | None) -> None:
     if not email or not password:
         await _close_context(p, browser, context, save_state=False)
         raise RuntimeError(
-            "Email and password are required for login. "
-            "Provide them as arguments or set PRUSA_EMAIL and PRUSA_PASSWORD."
+            "Email and password are required for login. Provide them as arguments or set PRUSA_EMAIL and PRUSA_PASSWORD."
         )
 
     try:
         await _perform_login(page, email, password)
 
         if not await _is_already_logged_in(page):
-            raise RuntimeError(
-                "Login flow completed but session is not authenticated. "
-                "Check your credentials."
-            )
+            raise RuntimeError("Login flow completed but session is not authenticated. Check your credentials.")
     except PWTimeoutError as e:
         raise RuntimeError(f"Login timed out: {e}") from e
     finally:
@@ -111,12 +107,7 @@ async def _is_already_logged_in(page) -> bool:
     """Check if user is already authenticated."""
     content = await page.content()
     title = await page.title()
-    return (
-        "Sign in" not in content
-        and "Log in" not in content
-        and "Sign in" not in title
-        and "Log in" not in title
-    )
+    return "Sign in" not in content and "Log in" not in content and "Sign in" not in title and "Log in" not in title
 
 
 async def _perform_login(page, email: str, password: str) -> None:
@@ -243,8 +234,8 @@ async def _try_find_field(page, selectors: list[str]):
 
 
 def _get_session_cookies() -> dict[str, str]:
-    """
-    Extract cookies from the stored session state file.
+    """Extract cookies from the stored session state file.
+
     Returns a dict suitable for httpx requests.
     """
     if not Path(STATE_FILE).exists():
@@ -272,9 +263,7 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
     cookies = _get_session_cookies()
 
     if not cookies:
-        logger.error(
-            "No session cookies found. Please log in first using connect_login."
-        )
+        logger.error("No session cookies found. Please log in first using connect_login.")
         return None
 
     headers = {
@@ -319,13 +308,9 @@ async def get_printer_files(printer_uuid: str, limit: int = 100) -> str:
 
         # Try to extract some meta info when present
         meta = f.get("meta") or {}
-        est = meta.get("estimated_printing_time_normal_mode") or meta.get(
-            "estimated_print_time"
-        )
+        est = meta.get("estimated_printing_time_normal_mode") or meta.get("estimated_print_time")
 
-        lines.append(
-            f"{name} ({ftype}) - {path} - size={size} bytes - mtime={mtime} - est={est}"
-        )
+        lines.append(f"{name} ({ftype}) - {path} - size={size} bytes - mtime={mtime} - est={est}")
 
     return "\n".join(lines)
 
@@ -356,17 +341,13 @@ async def get_printer_storages(printer_uuid: str) -> str:
         stype = s.get("type")
         ro = s.get("read_only")
 
-        lines.append(
-            f"{name} ({stype}) mounted at {mount} - free={free} bytes - files={fcount} - read_only={ro}"
-        )
+        lines.append(f"{name} ({stype}) mounted at {mount} - free={free} bytes - files={fcount} - read_only={ro}")
 
     return "\n".join(lines)
 
 
 @mcp.tool()
-async def send_printer_command(
-    printer_uuid: str, command: str, args: dict[str, Any] | None = None
-) -> str:
+async def send_printer_command(printer_uuid: str, command: str, args: dict[str, Any] | None = None) -> str:
     """Send a command to a specific printer.
 
     Args:
@@ -402,7 +383,7 @@ async def send_printer_command(
         async with httpx.AsyncClient(cookies=cookies, timeout=30.0) as client:
             url = f"{PRUSA_API_BASE}{endpoint}"
 
-            logger.info(f"Sending command to {url}: {payload}")
+            logger.info("Sending command to %s: %s", url, payload)
 
             response = await client.post(
                 url,
@@ -420,10 +401,8 @@ async def send_printer_command(
 
     except httpx.HTTPStatusError as e:
         logger.exception("HTTP error sending command")
-        return (
-            f"Failed to send command: HTTP {e.response.status_code} - {e.response.text}"
-        )
-    except Exception as e:
+        return f"Failed to send command: HTTP {e.response.status_code} - {e.response.text}"
+    except (httpx.RequestError, json.JSONDecodeError) as e:
         logger.exception("Error sending command")
         return f"Error sending command: {e!s}"
 
@@ -653,12 +632,8 @@ async def get_printer_events(printer_uuid: str, limit: int = 100) -> str:
         data_repr = None
         if isinstance(data_field, dict):
             # pick a few keys to show
-            keys = [
-                k
-                for k in ("target_nozzle", "target_bed", "path", "size")
-                if k in data_field
-            ]
-            if keys:
+            keys = [k for k in ("target_nozzle", "target_bed", "path", "size") if k in data_field]
+            if keys:  # noqa: SIM108
                 data_repr = ", ".join(f"{k}={data_field[k]}" for k in keys)
             else:
                 data_repr = json.dumps(data_field)
@@ -673,7 +648,7 @@ async def get_printer_events(printer_uuid: str, limit: int = 100) -> str:
 
 
 def main():
-    # Initialize and run the server
+    """Initialize and run the MCP server."""
     mcp.run(transport="stdio")
 
 
