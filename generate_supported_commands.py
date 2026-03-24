@@ -184,8 +184,7 @@ def _render_command(cmd: dict) -> list[str]:
         lines.append("")
         lines.append("| Argument | Type | Required | Description |")
         lines.append("|----------|------|----------|-------------|")
-        for arg in args:
-            lines.append(_format_arg_row(arg))
+        lines.extend(_format_arg_row(arg) for arg in args)
 
     lines.append("")
     return lines
