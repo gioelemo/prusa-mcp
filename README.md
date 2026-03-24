@@ -10,7 +10,7 @@ MCP server for interacting with Prusa Connect via session-based authentication u
 - **Printer Management**: List all printers and get detailed status information
 - **Job Tracking**: View recent print jobs for specific printers
 - **File & Storage Management**: Browse printer files and storage devices
-- **Printer Commands**: Send commands directly to printers (pause, resume, temperature, etc.)
+- **Printer Commands**: Send commands directly to printers (pause, resume, temperature, etc.) — see the full [command reference](supported_command.md)
 - **Event Monitoring**: Fetch recent printer events
 
 ## Installation

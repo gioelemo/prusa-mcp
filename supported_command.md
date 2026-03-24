@@ -1,6 +1,6 @@
 # Prusa Connect — Command Reference
 
-> **Warning:** This reference was auto-generated from reverse-engineered Prusa Connect commands. This is **not an official API** — commands were extracted by inspecting network traffic and may be incomplete or inaccurate. Not all commands have been tested. Some may not work as expected or could cause unintended behavior — including potential damage to the printer. **Use at your own risk** and always verify commands in a safe environment before relying on them.
+> **Warning:** This reference was built from reverse-engineered Prusa Connect commands. This is **not an official API** — commands were extracted by inspecting network traffic and may be incomplete or inaccurate. Not all commands have been tested. Some may not work as expected or could cause unintended behavior — including potential damage to the printer. **Use at your own risk** and always verify commands in a safe environment before relying on them.
 
 ## Table of Contents
 
