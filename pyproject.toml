@@ -116,6 +116,13 @@ max-complexity = 10
 [tool.ruff.lint.pylint]
 max-args = 5
 
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+include = ["src/**", "main.py", "script.py"]
+reportMissingImports = "none"
+reportMissingModuleSource = "none"
+
 [tool.mypy]
 warn_redundant_casts = true
 warn_unused_ignores = false
