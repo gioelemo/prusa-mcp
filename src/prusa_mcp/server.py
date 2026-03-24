@@ -402,7 +402,7 @@ async def send_printer_command(printer_uuid: str, command: str, args: dict[str, 
     except httpx.HTTPStatusError as e:
         logger.exception("HTTP error sending command")
         return f"Failed to send command: HTTP {e.response.status_code} - {e.response.text}"
-    except Exception as e:
+    except (httpx.RequestError, json.JSONDecodeError) as e:
         logger.exception("Error sending command")
         return f"Error sending command: {e!s}"
 
