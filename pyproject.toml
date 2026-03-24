@@ -129,7 +129,7 @@ max-args = 5
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
-include = ["src/**", "script.py"]
+include = ["src/**"]
 reportMissingImports = "none"
 reportMissingModuleSource = "none"
 
