@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 # Constants
-PRUSA_API_BASE = "https://connect.prusa3d.com/app"
 CONNECT_URL = os.environ.get("PRUSA_CONNECT_URL", "https://connect.prusa3d.com")
+PRUSA_API_BASE = CONNECT_URL.rstrip("/") + "/app"
 
 # Where we persist session cookies (storage_state). Keep this private!
 STATE_FILE = os.environ.get("PRUSA_CONNECT_STATE", "connect_state.json")
@@ -88,15 +88,21 @@ async def ensure_login(email: str | None, password: str | None) -> None:
 
     if not email or not password:
         await _close_context(p, browser, context, save_state=False)
-        raise RuntimeError
+        raise RuntimeError(
+            "Email and password are required for login. "
+            "Provide them as arguments or set PRUSA_EMAIL and PRUSA_PASSWORD."
+        )
 
     try:
         await _perform_login(page, email, password)
 
         if not await _is_already_logged_in(page):
-            raise RuntimeError
+            raise RuntimeError(
+                "Login flow completed but session is not authenticated. "
+                "Check your credentials."
+            )
     except PWTimeoutError as e:
-        raise RuntimeError from e
+        raise RuntimeError(f"Login timed out: {e}") from e
     finally:
         await _close_context(p, browser, context)
 
@@ -145,7 +151,7 @@ async def _click_login_button(page) -> None:
     ]
 
     if not await _try_click_selectors(page, login_button_selectors):
-        raise RuntimeError
+        raise RuntimeError("Could not find a login button on the page.")
 
 
 async def _find_email_field(page):
@@ -165,7 +171,7 @@ async def _find_email_field(page):
             field = page.get_by_label("Email", exact=False).first
 
     if field is None:
-        raise RuntimeError
+        raise RuntimeError("Could not find the email input field on the login page.")
 
     return field
 
@@ -184,7 +190,7 @@ async def _find_password_field(page):
             field = page.get_by_label("Password", exact=False).first
 
     if field is None:
-        raise RuntimeError
+        raise RuntimeError("Could not find the password input field on the login page.")
 
     return field
 
@@ -207,7 +213,7 @@ async def _submit_login_form(page, password_field) -> None:
     # Fallback strategies
     try:
         await page.get_by_role("button").first.click()
-    except Exception:
+    except (PWTimeoutError, AttributeError, OSError):
         await password_field.press("Enter")
 
 
@@ -219,7 +225,7 @@ async def _try_click_selectors(page, selectors: list[str]) -> bool:
             if await element.is_visible(timeout=2000):
                 await element.click()
                 return True
-        except Exception:
+        except (PWTimeoutError, AttributeError, OSError):
             continue
     return False
 
@@ -231,7 +237,7 @@ async def _try_find_field(page, selectors: list[str]):
             field = page.locator(selector).first
             if await field.is_visible(timeout=2000):
                 return field
-        except Exception:
+        except (PWTimeoutError, AttributeError, OSError):
             continue
     return None
 
@@ -251,7 +257,7 @@ def _get_session_cookies() -> dict[str, str]:
         cookies = {}
         for cookie in state.get("cookies", []):
             cookies[cookie["name"]] = cookie["value"]
-    except Exception:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
         logger.exception("Failed to read session cookies")
         return {}
     else:
@@ -280,8 +286,8 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
             response = await client.get(url, headers=headers, timeout=30.0)
             response.raise_for_status()
             return response.json()
-        except Exception:
-            logger.exception("API request failed")
+        except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError):
+            logger.exception("API request failed for %s", url)
             return None
 
 
@@ -597,8 +603,8 @@ async def get_printer_jobs(printer_uuid: str, limit: int = 5) -> str:
                 else:
                     # generic relative path
                     preview = CONNECT_URL.rstrip("/") + "/" + p.lstrip("/")
-            except Exception:
-                # If normalization fails for any reason, leave preview unchanged
+            except (ValueError, AttributeError):
+                # If normalization fails, leave preview unchanged
                 pass
 
         # Don't include preview in output as it doesn't render properly in Streamlit

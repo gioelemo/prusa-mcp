@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/setup-python@v4
         with:
-          python-version: 3.x
+          python-version: "3.12"
       - uses: actions/checkout@v4
-      - run: pip install mypy numpy pytest
+      - run: pip install mypy
       - run: mypy
