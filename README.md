@@ -17,7 +17,7 @@ MCP server for interacting with Prusa Connect via session-based authentication u
 
 1. Install dependencies with uv:
 ```bash
-uv pip install -e .
+uv sync
 ```
 
 2. Install Playwright browsers:
