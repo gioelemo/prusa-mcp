@@ -11,6 +11,7 @@ authors = [
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.18.0",
+    "pywebview>=5.0",
 ]
 
 [project.scripts]
@@ -128,5 +129,6 @@ exclude = [
 [[tool.mypy.overrides]]
 module = [
     "httpx",
+    "webview",
 ]
 ignore_missing_imports = true

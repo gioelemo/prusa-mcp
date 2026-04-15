@@ -18,18 +18,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="prusa-mcp", description="Prusa Connect MCP server")
     sub = parser.add_subparsers(dest="command")
 
-    login_parser = sub.add_parser("login", help="Authenticate with Prusa Account (OAuth2 PKCE)")
-    login_parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="Print the authorization URL instead of opening a browser.",
-    )
-    login_parser.add_argument(
-        "--timeout",
-        type=float,
-        default=300.0,
-        help="Seconds to wait for the OAuth callback (default: 300).",
-    )
+    sub.add_parser("login", help="Authenticate with Prusa Account (OAuth2 PKCE)")
 
     args = parser.parse_args()
 
@@ -40,7 +29,7 @@ def main() -> None:
         from prusa_mcp.oauth import login_interactive  # noqa: PLC0415
 
         try:
-            login_interactive(open_browser=not args.no_browser, timeout=args.timeout)
+            login_interactive()
         except RuntimeError as e:
             print(f"Login failed: {e}", file=sys.stderr)
             sys.exit(1)

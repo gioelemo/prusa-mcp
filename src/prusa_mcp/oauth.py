@@ -4,7 +4,7 @@ Prusa Connect's internal REST API (``/app/*``) is authenticated via OAuth2
 Bearer tokens issued by ``account.prusa3d.com`` — the same public client
 that the official PrusaSlicer desktop app uses. This module implements:
 
-- An interactive login via loopback redirect (PKCE, no client secret).
+- An interactive login via an embedded native webview (PKCE, no client secret).
 - Persistent storage of the refresh token on disk (0600 permissions).
 - Silent refresh of expired access tokens.
 - A single async accessor ``get_access_token()`` used by the MCP tools.
@@ -19,18 +19,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import http.server
 import json
 import logging
 import os
 from pathlib import Path
 import secrets
-import socket
-import threading
 import time
 from typing import Any
 import urllib.parse
-import webbrowser
 
 import httpx
 
@@ -42,15 +38,31 @@ logger = logging.getLogger(__name__)
 # ----------------------------
 ACCOUNT_URL = os.environ.get("PRUSA_ACCOUNT_URL", "https://account.prusa3d.com").rstrip("/")
 
-# Public client id used by PrusaSlicer / Prusa Connect web app. Served from
-# https://connect.prusa3d.com/environment.js as ACCOUNT_CLIENT_ID.
-CLIENT_ID = os.environ.get("PRUSA_OAUTH_CLIENT_ID", "MRHTlZhZqkNrrQ6FUPtjyusAz8nc59ErHXP8XkS4")
+# Public OAuth client used by the PrusaSlicer desktop app. This is the same
+# client id hard-coded in
+# https://github.com/prusa3d/PrusaSlicer/blob/main/src/slic3r/Utils/ServiceConfig.cpp
+# (``m_account_client_id``). We reuse it because it is the only public Prusa
+# client whose registered redirect URI we can intercept without paste-back
+# or a real browser: PrusaSlicer registers ``prusaslicer://login`` as an OS
+# URL handler, and we can catch that navigation inside an embedded webview.
+#
+# The Connect web client ("MRHTl...") only accepts
+# ``https://connect.prusa3d.com/login/auth-callback`` as a redirect, which
+# would force the user to copy-paste the callback URL back into the CLI.
+CLIENT_ID = os.environ.get("PRUSA_OAUTH_CLIENT_ID", "oamhmhZez7opFosnwzElIgE2oGgI2iJORSkw587O")
 
 TOKEN_URL = f"{ACCOUNT_URL}/o/token/"
 AUTHORIZE_URL = f"{ACCOUNT_URL}/o/authorize/"
 
-# Scopes observed on the Connect web app access token.
-SCOPES = "basic_info connect user_operations email_lists openid"
+# Custom-scheme redirect URI registered for the PrusaSlicer OAuth client.
+# We never actually launch ``prusaslicer://login`` — we intercept the
+# navigation inside our embedded webview before the OS tries to hand it off.
+REDIRECT_URI = "prusaslicer://login"
+
+# Scope requested by PrusaSlicer itself. Confirmed sufficient for the Connect
+# ``/app/printers/`` family of endpoints: PrusaSlicer hits those endpoints with
+# a token obtained from this exact (client_id, scope) pair.
+SCOPES = "basic_info"
 
 # Refresh a little before real expiry to avoid races.
 EXPIRY_LEEWAY_SECONDS = 60
@@ -146,84 +158,71 @@ def _pkce_pair() -> tuple[str, str]:
 
 
 # ----------------------------
-# Loopback callback server
+# Interactive login (paste-back flow)
 # ----------------------------
-class _CallbackHandler(http.server.BaseHTTPRequestHandler):
-    """Single-shot handler that captures the ``code`` query parameter."""
+def _extract_code_from_url(url: str) -> tuple[str, str | None]:
+    """Parse a pasted callback URL and return ``(code, state)``.
 
-    # These are set by the outer login function on the class.
-    result: dict[str, str] = {}  # noqa: RUF012
-    done_event: threading.Event | None = None
+    Accepts either a full URL (``https://connect.prusa3d.com/login/auth-callback?...``)
+    or just the query string (``code=...&state=...``).
+    """
+    s = url.strip()
+    # Tolerate users pasting just the query, or a leading ``?``.
+    if "://" in s:
+        parsed = urllib.parse.urlparse(s)
+        query = parsed.query
+    else:
+        query = s.lstrip("?")
 
-    def do_GET(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/callback":
-            self.send_response(404)
-            self.end_headers()
-            return
+    params = urllib.parse.parse_qs(query)
+    error = params.get("error", [None])[0]
+    if error:
+        description = params.get("error_description", [""])[0]
+        raise RuntimeError(f"OAuth authorization failed: {error} {description}".strip())
 
-        params = urllib.parse.parse_qs(parsed.query)
-        code = params.get("code", [None])[0]
-        state = params.get("state", [None])[0]
-        error = params.get("error", [None])[0]
-
-        if error:
-            _CallbackHandler.result["error"] = error
-            body = f"<h1>Login failed</h1><p>{error}</p>".encode()
-        elif code:
-            _CallbackHandler.result["code"] = code
-            if state:
-                _CallbackHandler.result["state"] = state
-            body = b"<h1>prusa-mcp: login successful</h1><p>You can close this tab and return to the terminal.</p>"
-        else:
-            _CallbackHandler.result["error"] = "missing_code"
-            body = b"<h1>Login failed</h1><p>No authorization code received.</p>"
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-        if _CallbackHandler.done_event is not None:
-            _CallbackHandler.done_event.set()
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002, ARG002
-        # Silence default stderr logging from BaseHTTPRequestHandler.
-        return
+    code = params.get("code", [None])[0]
+    if not code:
+        raise RuntimeError("No 'code' parameter found in the pasted URL. Make sure you copied the full address.")
+    state = params.get("state", [None])[0]
+    return code, state
 
 
-def _pick_free_port() -> int:
-    """Ask the OS for a free TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def login_interactive() -> dict[str, Any]:  # noqa: C901
+    """Run the PKCE flow inside an embedded webview, persist tokens, and return them.
 
-
-# ----------------------------
-# Interactive login
-# ----------------------------
-def login_interactive(*, open_browser: bool = True, timeout: float = 300.0) -> dict[str, Any]:
-    """Run the full PKCE flow, persist tokens, and return them.
-
-    Args:
-        open_browser: Automatically open the authorization URL in the user's
-            default browser. When False, the URL is only printed — useful for
-            headless or CI environments where you want to copy-paste manually.
-        timeout: Seconds to wait for the callback before aborting.
+    Flow:
+        1. Generate PKCE + state and build the ``/o/authorize/`` URL using
+           PrusaSlicer's public OAuth client + ``prusaslicer://login`` redirect.
+        2. Open the URL inside a ``pywebview`` window. The user signs in to
+           Prusa Account as normal (SSO, 2FA, passkeys are all supported —
+           it's a real native webview).
+        3. On success, Prusa Account redirects the webview to
+           ``prusaslicer://login?code=...&state=...``. A background watcher
+           thread polls the webview's current URL, captures the callback, and
+           destroys the window before the OS hands the custom-scheme URL off
+           to any real PrusaSlicer install.
+        4. POST the code + PKCE verifier to ``/o/token/`` and save the result.
 
     Raises:
-        RuntimeError: on any failure (timeout, auth error, token exchange error).
+        RuntimeError: on any failure during authorization or token exchange.
     """
+    try:
+        import webview  # type: ignore[import-not-found]  # noqa: PLC0415
+    except ImportError as e:
+        raise RuntimeError(
+            "The 'login' subcommand requires the 'pywebview' package. "
+            "Run `uv sync` (or `pip install pywebview`) before retrying. "
+            "On Linux you also need system WebKit2GTK (e.g. `apt install "
+            "gir1.2-webkit2-4.1`)."
+        ) from e
+
     verifier, challenge = _pkce_pair()
     state = secrets.token_urlsafe(16)
-    port = _pick_free_port()
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
 
     auth_params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": redirect_uri,
+        "redirect_uri": REDIRECT_URI,
         "scope": SCOPES,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
@@ -231,41 +230,53 @@ def login_interactive(*, open_browser: bool = True, timeout: float = 300.0) -> d
     }
     authorize_url = f"{AUTHORIZE_URL}?{urllib.parse.urlencode(auth_params)}"
 
-    # Reset class-level state on the handler, then start the server.
-    _CallbackHandler.result = {}
-    _CallbackHandler.done_event = threading.Event()
-    server = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    # The webview runs on the main thread; the watcher runs on a background
+    # thread started by ``webview.start``. We pass results back through this
+    # mutable dict.
+    captured: dict[str, str | None] = {"url": None, "error": None}
 
-    try:
-        print(f"\nOpen this URL in your browser to log in to Prusa Account:\n\n  {authorize_url}\n")
-        if open_browser:
+    def watcher(win: Any) -> None:
+        """Poll the webview's current URL until it hits ``prusaslicer://login``."""
+        deadline = time.monotonic() + 300.0  # 5 minutes should be plenty.
+        while time.monotonic() < deadline:
             try:
-                webbrowser.open(authorize_url)
-            except webbrowser.Error:
-                logger.debug("webbrowser.open failed; user will copy-paste manually")
+                url = win.get_current_url()
+            except Exception:  # noqa: BLE001
+                url = None
+            if url and url.startswith("prusaslicer://"):
+                captured["url"] = url
+                break
+            time.sleep(0.1)
+        else:
+            captured["error"] = "Timed out (5 min) waiting for the OAuth callback."
+        try:
+            win.destroy()
+        except Exception:  # noqa: BLE001
+            logger.debug("webview destroy failed", exc_info=True)
 
-        if not _CallbackHandler.done_event.wait(timeout=timeout):
-            raise RuntimeError(f"Timed out after {timeout:.0f}s waiting for the OAuth callback.")
-    finally:
-        server.shutdown()
-        server.server_close()
+    window = webview.create_window(
+        title="Sign in to Prusa Account",
+        url=authorize_url,
+        width=520,
+        height=760,
+    )
+    webview.start(watcher, window)
 
-    result = _CallbackHandler.result
-    if "error" in result:
-        raise RuntimeError(f"OAuth authorization failed: {result['error']}")
-    if result.get("state") != state:
+    if captured["error"]:
+        raise RuntimeError(captured["error"])
+    callback_url = captured["url"]
+    if not callback_url:
+        raise RuntimeError("Login window was closed before a callback was received.")
+
+    code, returned_state = _extract_code_from_url(callback_url)
+    if returned_state != state:
         raise RuntimeError("OAuth state mismatch — possible CSRF, aborting.")
-    code = result.get("code")
-    if not code:
-        raise RuntimeError("OAuth authorization did not return a code.")
 
-    # Exchange the code for tokens.
+    # Exchange the code for tokens. Must match the redirect_uri used above.
     token_payload = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": redirect_uri,
+        "redirect_uri": REDIRECT_URI,
         "client_id": CLIENT_ID,
         "code_verifier": verifier,
     }
