@@ -310,8 +310,18 @@ async def _refresh(refresh_token: str) -> dict[str, Any]:
         )
     new_tokens = resp.json()
     # Django OAuth Toolkit rotates refresh tokens on each use and also returns
-    # a new one in the response. Persist whatever we got back.
-    _save_tokens(new_tokens)
+    # a new one in the response. Persist whatever we got back — unless the
+    # token file was deleted out from under us while the refresh was in flight
+    # (e.g. the host cleared tokens on a shared volume), in which case
+    # resurrecting the file would silently undo the user's action.
+    path = _default_token_path()
+    if path.exists():
+        _save_tokens(new_tokens)
+    else:
+        logger.info("Token file was removed during refresh; not persisting new tokens.")
+        raise LoginRequired(
+            "Token file was cleared during refresh. Run `prusa-mcp login` to re-authenticate."
+        )
     return new_tokens
 
 
@@ -331,6 +341,14 @@ async def get_access_token() -> str:
     global _cached  # noqa: PLW0603
 
     async with _lock:
+        # Drop the in-memory cache if the token file has been removed out from
+        # under us (e.g. the host cleared tokens on a shared volume). Without
+        # this check we would happily keep serving requests with the cached
+        # access token — and a later refresh would resurrect the deleted file.
+        if _cached is not None and not _default_token_path().exists():
+            logger.info("Token file disappeared; dropping in-memory cache.")
+            _cached = None
+
         if _cached is None:
             _cached = _load_tokens()
         if _cached is None:
