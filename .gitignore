@@ -1,6 +1,7 @@
 # Project-specific
-connect_state.json
-trace.zip
+prusa_tokens.json
+tokens.json
+data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

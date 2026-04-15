@@ -5,11 +5,11 @@
 [![code style: Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Checked with mypy](http://www.mypy-lang.org/static/mypy_badge.svg)](http://mypy-lang.org/)
 
-MCP server for interacting with Prusa Connect via session-based authentication using Playwright browser automation.
+MCP server for interacting with Prusa Connect via OAuth2 (Authorization Code + PKCE) against Prusa Account — the same public client used by PrusaSlicer and the Connect web app.
 
 ## Features
 
-- **Session-based Authentication**: Log in once with username and password, session cookies are persisted for future use
+- **OAuth2 Authentication**: One-time interactive login via your browser; refresh tokens are persisted and rotated automatically
 - **Printer Management**: List all printers and get detailed status information
 - **Job Tracking**: View recent print jobs for specific printers
 - **File & Storage Management**: Browse printer files and storage devices
@@ -18,32 +18,39 @@ MCP server for interacting with Prusa Connect via session-based authentication u
 
 ## Installation
 
-1. Install dependencies with uv:
+Install dependencies with uv:
 ```bash
 uv sync
 ```
 
-2. Install Playwright browsers:
+That's it — no browser binaries, no system packages.
+
+## Authentication
+
+Run this once, on a machine with a web browser:
+
 ```bash
-uv run playwright install chromium
+uv run prusa-mcp login
 ```
+
+This opens your default browser at `account.prusa3d.com`, you log in with your Prusa credentials (SSO, 2FA, passkeys — whatever you use on the website), and the server receives the OAuth callback on `127.0.0.1`. Access and refresh tokens are saved to `~/.config/prusa-mcp/tokens.json` (override with `PRUSA_TOKEN_FILE`) with mode `0600`.
+
+From then on the MCP server refreshes access tokens silently. You only need to re-run `prusa-mcp login` if the refresh token is ever revoked.
+
+Running inside Docker? Run `prusa-mcp login` on the **host**, point `PRUSA_TOKEN_FILE` at a file on a volume mounted into the container, and the server will read and refresh tokens from there.
 
 ## Configuration
 
-The server uses the following environment variables (optional):
+All environment variables are optional:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PRUSA_CONNECT_URL` | `https://connect.prusa3d.com` | Base URL for Prusa Connect |
-| `PRUSA_CONNECT_STATE` | `connect_state.json` | Path to session state file |
-| `PRUSA_EMAIL` | — | Default login email |
-| `PRUSA_PASSWORD` | — | Default login password |
-| `HEADLESS` | `1` | Run browser headless (`0` to watch) |
-| `PW_TRACING` | `0` | Enable Playwright tracing |
-| `PW_NAV_TIMEOUT_MS` | `30000` | Navigation timeout (ms) |
-| `PW_SEL_TIMEOUT_MS` | `15000` | Selector timeout (ms) |
+| `PRUSA_ACCOUNT_URL` | `https://account.prusa3d.com` | Base URL for Prusa Account (OAuth) |
+| `PRUSA_TOKEN_FILE` | `~/.config/prusa-mcp/tokens.json` | Path to the OAuth token file |
+| `PRUSA_OAUTH_CLIENT_ID` | *(PrusaSlicer client)* | Override the public OAuth client id |
 
-You can create a `.env` file to set these variables.
+You can create a `.env` file from `.env.example` to set these.
 
 ## Usage
 
@@ -79,12 +86,12 @@ python -m prusa_mcp
 ### Available Tools
 
 #### `connect_login`
-Log in to Prusa Connect and save session cookies for later use.
+Report the current Prusa Connect authentication status. Authentication itself happens out-of-band via the `prusa-mcp login` CLI subcommand (OAuth2 PKCE). This tool only checks that stored tokens are valid and refreshable. The legacy `email`/`password` parameters are accepted for backwards compatibility but ignored.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `email` | string | No | Prusa Connect email (falls back to `PRUSA_EMAIL`) |
-| `password` | string | No | Prusa Connect password (falls back to `PRUSA_PASSWORD`) |
+| `email` | string | No | Ignored — kept for backwards compatibility |
+| `password` | string | No | Ignored — kept for backwards compatibility |
 
 #### `get_printers`
 Get a list of all your Prusa printers.
@@ -142,19 +149,22 @@ Fetch recent events for a printer.
 
 ## Security Notes
 
-- **Session Persistence**: The server stores session cookies in `connect_state.json` (or the path specified in `PRUSA_CONNECT_STATE`). This file contains your logged-in session and should be treated as sensitive.
-- **Dedicated Account**: Consider using a dedicated service account for automated access rather than your personal account.
-- **Credentials**: Never hard-code credentials in your scripts. Use the `connect_login` tool to authenticate at runtime or store credentials securely in environment variables.
+- **Token File**: The refresh and access tokens are stored in `PRUSA_TOKEN_FILE` (default `~/.config/prusa-mcp/tokens.json`), written with `0600` permissions. Treat this file like a password — anyone with a copy can act as you against Prusa Connect until the refresh token is revoked.
+- **No Credentials on Disk**: Your Prusa Account email and password are never stored by this server; they are only ever entered on `account.prusa3d.com` itself during the one-time browser login.
+- **Public Client + PKCE**: Authentication uses the public PrusaSlicer OAuth client with PKCE — there is no client secret to leak. The authorization code is bound to a per-login verifier and a loopback redirect on `127.0.0.1`, so intercepting the code is not enough to mint a token.
+- **Dedicated Account**: Consider using a dedicated service account for automated access rather than your personal one.
+- **Revoking Access**: To revoke this server's access, sign in to `account.prusa3d.com`, remove the authorized application, and delete the local token file.
 
 ## How It Works
 
-1. **First Login**: Call `connect_login` with your username and password. The server uses Playwright to automate the browser login process.
-2. **Session Storage**: After successful login, session cookies are saved to `connect_state.json`.
-3. **Subsequent Requests**: All API calls use the stored session cookies, so you don't need to log in again until the session expires.
-4. **API Access**: The server makes HTTP requests to the Prusa Connect API using the authenticated session.
+1. **First Login**: Run `prusa-mcp login`. The CLI generates a PKCE pair, starts a loopback HTTP server on a random port, and opens `account.prusa3d.com/o/authorize/` in your browser. After you sign in, Prusa Account redirects to `http://127.0.0.1:<port>/callback` with an authorization code.
+2. **Token Exchange**: The CLI posts the code + PKCE verifier to `account.prusa3d.com/o/token/` and receives an access token and a refresh token, which it writes to the token file.
+3. **API Requests**: The MCP tools call `get_access_token()` before every request. If the cached access token is still valid (JWT `exp` check with a 60-second leeway), it's reused; otherwise the refresh token is exchanged for a new pair, which is written back to disk.
+4. **Bearer Auth**: All Prusa Connect API calls attach `Authorization: Bearer <jwt>` — the same mechanism PrusaSlicer uses. This makes write endpoints like `send_printer_command` work, which cookie-based auth alone does not.
 
 ## Troubleshooting
 
-- **Login Issues**: If login fails, try setting `HEADLESS=0` to watch the browser and see what's happening.
-- **Session Expired**: If you get authentication errors, delete `connect_state.json` and log in again.
-- **Tracing**: Enable `PW_TRACING=1` to generate a trace file (`trace.zip`) for debugging Playwright issues.
+- **`Not authenticated` from the tools**: Run `uv run prusa-mcp login` to generate or refresh the token file.
+- **Refresh token rejected**: The refresh token may have been revoked (e.g. you changed your password or removed the authorized app in the Prusa Account dashboard). Delete the token file and run `prusa-mcp login` again.
+- **Headless / no browser available**: Pass `--no-browser` to `prusa-mcp login` and copy-paste the printed URL into any browser that can reach `account.prusa3d.com` and `127.0.0.1:<port>` on the machine running the CLI. For remote/SSH setups, use SSH port-forwarding or run the login on the host and share the token file via a mounted volume.
+- **Docker**: Run `prusa-mcp login` on the host, not inside the container. Point `PRUSA_TOKEN_FILE` at a path inside a volume mounted into both host and container.

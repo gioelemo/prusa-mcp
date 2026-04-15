@@ -1,276 +1,61 @@
-"""Prusa Connect MCP server — tools and login flow."""
+"""Prusa Connect MCP server — tools backed by OAuth2 Bearer auth.
 
-from contextlib import suppress
+Authentication is delegated to :mod:`prusa_mcp.oauth`: the MCP tools call
+:func:`~prusa_mcp.oauth.get_access_token` before every request, which handles
+loading tokens from disk and refreshing them silently. Interactive login
+happens out-of-band via the ``prusa-mcp login`` CLI subcommand.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 import os
-from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 import httpx
 from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
-from playwright.async_api import async_playwright  # type: ignore[import-not-found]
-from playwright.async_api import TimeoutError as PWTimeoutError
 
-# Load environment variables from .env file
-load_dotenv()
+from prusa_mcp.oauth import get_access_token
+from prusa_mcp.oauth import LoginRequired
 
 # Initialize FastMCP server
 mcp = FastMCP("prusa-printer")
 logger = logging.getLogger(__name__)
 
 
+# ----------------------------
 # Constants
+# ----------------------------
 CONNECT_URL = os.environ.get("PRUSA_CONNECT_URL", "https://connect.prusa3d.com")
 PRUSA_API_BASE = CONNECT_URL.rstrip("/") + "/app"
 
-# Where we persist session cookies (storage_state). Keep this private!
-STATE_FILE = os.environ.get("PRUSA_CONNECT_STATE", "connect_state.json")
-
-# Headless by default; set HEADLESS=0 to watch the browser
-HEADLESS = os.environ.get("HEADLESS", "1") != "0"
-
-# Optional: Enable Playwright tracing for debugging (stores trace.zip)
-ENABLE_TRACING = os.environ.get("PW_TRACING", "0") == "1"
-
-# Reasonable default timeouts (ms)
-NAV_TIMEOUT = int(os.environ.get("PW_NAV_TIMEOUT_MS", "30000"))
-SEL_TIMEOUT = int(os.environ.get("PW_SEL_TIMEOUT_MS", "15000"))
-
 
 # ----------------------------
-# Utility: open a browser context
+# HTTP helpers
 # ----------------------------
-async def _open_context():
-    """Launch Chromium and return (playwright, browser, context).
-
-    If STATE_FILE exists, we reuse it (keeps you logged in).
-    """
-    p = await async_playwright().start()
-    browser = await p.chromium.launch(headless=HEADLESS)
-    storage_state = STATE_FILE if Path(STATE_FILE).exists() else None  # noqa: ASYNC240
-    context = await browser.new_context(storage_state=storage_state)
-    if ENABLE_TRACING:
-        await context.tracing.start(screenshots=True, snapshots=True, sources=True)
-    return p, browser, context
-
-
-async def _close_context(p, browser, context, *, save_state=True):
-    """Optionally save storage_state for persistent sessions."""
-    try:
-        if ENABLE_TRACING:
-            await context.tracing.stop(path="trace.zip")
-        if save_state:
-            await context.storage_state(path=STATE_FILE)
-    finally:
-        await browser.close()
-        await p.stop()
-
-
-# ----------------------------
-# Core login flow
-# ----------------------------
-async def ensure_login(email: str | None, password: str | None) -> None:
-    """Navigate to Connect, and if not already authenticated, perform the login flow.
-
-    - If STATE_FILE already contains a valid session, this is a no-op.
-    - Otherwise, we require email+password to log in.
-    """
-    p, browser, context = await _open_context()
-    page = await context.new_page()
-    page.set_default_navigation_timeout(NAV_TIMEOUT)
-    await page.goto(CONNECT_URL, wait_until="domcontentloaded")
-
-    if await _is_already_logged_in(page):
-        await _close_context(p, browser, context)
-        return
-
-    if not email or not password:
-        await _close_context(p, browser, context, save_state=False)
-        raise RuntimeError(
-            "Email and password are required for login. Provide them as arguments or set PRUSA_EMAIL and PRUSA_PASSWORD."
-        )
-
-    try:
-        await _perform_login(page, email, password)
-
-        if not await _is_already_logged_in(page):
-            raise RuntimeError("Login flow completed but session is not authenticated. Check your credentials.")
-    except PWTimeoutError as e:
-        raise RuntimeError(f"Login timed out: {e}") from e
-    finally:
-        await _close_context(p, browser, context)
-
-
-async def _is_already_logged_in(page) -> bool:
-    """Check if user is already authenticated."""
-    content = await page.content()
-    title = await page.title()
-    return "Sign in" not in content and "Log in" not in content and "Sign in" not in title and "Log in" not in title
-
-
-async def _perform_login(page, email: str, password: str) -> None:
-    """Execute the complete login flow."""
-    await _click_login_button(page)
-    await page.wait_for_timeout(1500)  # Give the modal/form time to render
-
-    email_field = await _find_email_field(page)
-    password_field = await _find_password_field(page)
-
-    await email_field.fill(email)
-    await password_field.fill(password)
-    await page.wait_for_timeout(500)  # Let fields register
-
-    await _submit_login_form(page, password_field)
-    await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
-
-
-async def _click_login_button(page) -> None:
-    """Find and click the login button on the landing page."""
-    await page.wait_for_load_state("domcontentloaded")
-    await page.wait_for_timeout(1000)
-
-    login_button_selectors = [
-        "text='Log in or Sign up'",
-        "text='Log in'",
-        "text='Sign in'",
-        "button:has-text('Log in')",
-        "button:has-text('Sign up')",
-        "a:has-text('Log in')",
-        "a:has-text('Sign up')",
-    ]
-
-    if not await _try_click_selectors(page, login_button_selectors):
-        raise RuntimeError("Could not find a login button on the page.")
-
-
-async def _find_email_field(page):
-    """Locate the email input field."""
-    email_selectors = [
-        "input[type='email']",
-        "input[name='email']",
-        "input[name='username']",
-        "input[id='email']",
-        "input[placeholder*='mail' i]",
-        "input[placeholder*='username' i]",
-    ]
-
-    field = await _try_find_field(page, email_selectors)
-    if field is None:
-        with suppress(Exception):
-            field = page.get_by_label("Email", exact=False).first
-
-    if field is None:
-        raise RuntimeError("Could not find the email input field on the login page.")
-
-    return field
-
-
-async def _find_password_field(page):
-    """Locate the password input field."""
-    password_selectors = [
-        "input[type='password']",
-        "input[name='password']",
-        "input[id='password']",
-    ]
-
-    field = await _try_find_field(page, password_selectors)
-    if field is None:
-        with suppress(Exception):
-            field = page.get_by_label("Password", exact=False).first
-
-    if field is None:
-        raise RuntimeError("Could not find the password input field on the login page.")
-
-    return field
-
-
-async def _submit_login_form(page, password_field) -> None:
-    """Find and click the submit button, or press Enter as fallback."""
-    button_selectors = [
-        "button[type='submit']",
-        "input[type='submit']",
-        "button:has-text('Sign in')",
-        "button:has-text('Log in')",
-        "button:has-text('Login')",
-        "button:has-text('Continue')",
-        "form button",
-    ]
-
-    if await _try_click_selectors(page, button_selectors):
-        return
-
-    # Fallback strategies
-    try:
-        await page.get_by_role("button").first.click()
-    except (PWTimeoutError, AttributeError, OSError):
-        await password_field.press("Enter")
-
-
-async def _try_click_selectors(page, selectors: list[str]) -> bool:
-    """Try clicking elements matching the given selectors. Returns True if successful."""
-    for selector in selectors:
-        try:
-            element = page.locator(selector).first
-            if await element.is_visible(timeout=2000):
-                await element.click()
-                return True
-        except (PWTimeoutError, AttributeError, OSError):
-            continue
-    return False
-
-
-async def _try_find_field(page, selectors: list[str]):
-    """Try finding a field matching the given selectors. Returns None if not found."""
-    for selector in selectors:
-        try:
-            field = page.locator(selector).first
-            if await field.is_visible(timeout=2000):
-                return field
-        except (PWTimeoutError, AttributeError, OSError):
-            continue
-    return None
-
-
-def _get_session_cookies() -> dict[str, str]:
-    """Extract cookies from the stored session state file.
-
-    Returns a dict suitable for httpx requests.
-    """
-    if not Path(STATE_FILE).exists():
-        return {}
-
-    try:
-        with Path(STATE_FILE).open() as f:
-            state = json.load(f)
-
-        cookies = {}
-        for cookie in state.get("cookies", []):
-            cookies[cookie["name"]] = cookie["value"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError):
-        logger.exception("Failed to read session cookies")
-        return {}
-    else:
-        return cookies
+async def _auth_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Return request headers with a fresh Bearer token."""
+    token = await get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
 
 
 async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
-    """Make a request to the Prusa Connect API using session cookies."""
+    """GET a Prusa Connect ``/app`` endpoint and return parsed JSON (or ``None`` on error)."""
     url = f"{PRUSA_API_BASE}{endpoint}"
-
-    # Get cookies from stored session
-    cookies = _get_session_cookies()
-
-    if not cookies:
-        logger.error("No session cookies found. Please log in first using connect_login.")
+    try:
+        headers = await _auth_headers()
+    except LoginRequired:
+        logger.exception("Not authenticated")
         return None
 
-    headers = {
-        "Accept": "application/json",
-    }
-
-    async with httpx.AsyncClient(cookies=cookies) as client:
+    async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, headers=headers, timeout=30.0)
             response.raise_for_status()
@@ -278,6 +63,153 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
         except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError):
             logger.exception("API request failed for %s", url)
             return None
+
+
+# ----------------------------
+# Tools
+# ----------------------------
+@mcp.tool()
+async def connect_login(email: str = "", password: str = "") -> str:  # noqa: ARG001
+    """Report the Prusa Connect authentication status.
+
+    The legacy ``email``/``password`` parameters are accepted for backwards
+    compatibility but ignored: authentication now uses OAuth2 via the
+    ``prusa-mcp login`` CLI subcommand, which must be run once from a shell
+    that can open a browser (typically the host machine). Tokens are
+    persisted to disk and refreshed automatically.
+    """
+    try:
+        await get_access_token()
+    except LoginRequired as e:
+        return (
+            "Not authenticated. Run `prusa-mcp login` (or `uv run prusa-mcp login`) "
+            f"on a machine with a browser to authorize this server.\nDetails: {e}"
+        )
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.exception("Token refresh failed")
+        return f"Authentication check failed: {e!s}"
+    return "Authenticated — Prusa Connect tokens are valid and ready to use."
+
+
+@mcp.tool()
+async def get_printers(limit: int = 10) -> str:
+    """Get list of Prusa printers.
+
+    Args:
+        limit: Maximum number of printers to return (default: 10)
+    """
+    endpoint = f"/printers?limit={limit}"
+    data = await make_prusa_request(endpoint)
+
+    if not data:
+        return "Unable to fetch printer data."
+
+    printers = data.get("printers", [])
+    logger.info(data)
+
+    if not printers:
+        return "No printers found."
+
+    formatted_printers = [format_printer(printer) for printer in printers]
+    return "\n---\n".join(formatted_printers)
+
+
+@mcp.tool()
+async def get_printer_status(printer_uuid: str) -> str:
+    """Get detailed status of a specific printer.
+
+    Args:
+        printer_uuid: The UUID of the printer
+    """
+    endpoint = "/printers"
+    data = await make_prusa_request(endpoint)
+
+    if not data:
+        return "Unable to fetch printer data."
+
+    printers = data.get("printers", [])
+    printer = None
+
+    for p in printers:
+        if p.get("uuid") == printer_uuid or p.get("name") == printer_uuid:
+            printer = p
+            break
+
+    if not printer:
+        return f"Printer with UUID/name '{printer_uuid}' not found."
+
+    return format_printer(printer)
+
+
+@mcp.tool()
+async def get_printer_jobs(printer_uuid: str, limit: int = 5) -> str:
+    """Get recent jobs for a specific printer.
+
+    Args:
+        printer_uuid: The UUID of the printer
+        limit: Maximum number of jobs to return (default: 5)
+    """
+    endpoint = f"/printers/{printer_uuid}/jobs?limit={limit}"
+    data = await make_prusa_request(endpoint)
+
+    if not data:
+        return f"Unable to fetch jobs for printer {printer_uuid}."
+
+    jobs = data.get("jobs", []) or data.get("data", [])
+
+    if not jobs:
+        return "No jobs found for this printer."
+
+    formatted_jobs = []
+    for job in jobs:
+        job_id = job.get("id", "Unknown")
+        file_name = job.get("display_name") or job.get("file_name") or "Unknown"
+        status = job.get("status") or job.get("state") or "Unknown"
+        started = job.get("started_at") or job.get("start") or "Unknown"
+        completed = job.get("completed_at") or "N/A"
+        progress = job.get("progress", "N/A")
+
+        # Prefer `preview_url` if provided by the API; otherwise try other common fields
+        file_obj = job.get("file") or {}
+        preview = (
+            job.get("preview_url")
+            or job.get("display_path")
+            or job.get("display_url")
+            or file_obj.get("preview_url")
+            or file_obj.get("display_path")
+            or file_obj.get("display_url")
+            or job.get("thumbnail")
+            or job.get("preview")
+        )
+
+        # Normalize preview to a full absolute URL.
+        if preview:
+            try:
+                p = str(preview).strip()
+                if p.startswith(("http://", "https://")):
+                    preview = p
+                elif p.startswith("//"):
+                    preview = "https:" + p
+                elif p.startswith("/app"):
+                    preview = PRUSA_API_BASE.rstrip("/") + p[len("/app") :]
+                elif p.startswith("/"):
+                    preview = CONNECT_URL.rstrip("/") + p
+                else:
+                    preview = CONNECT_URL.rstrip("/") + "/" + p.lstrip("/")
+            except (ValueError, AttributeError):
+                pass
+
+        job_info = f"""
+Job ID: {job_id}
+File: {file_name}
+Status: {status}
+Started: {started}
+Completed: {completed}
+Progress: {progress}%
+"""
+        formatted_jobs.append(job_info)
+
+    return "\n---\n".join(formatted_jobs)
 
 
 @mcp.tool()
@@ -306,7 +238,6 @@ async def get_printer_files(printer_uuid: str, limit: int = 100) -> str:
         ftype = f.get("type")
         path = f.get("display_path") or f.get("path")
 
-        # Try to extract some meta info when present
         meta = f.get("meta") or {}
         est = meta.get("estimated_printing_time_normal_mode") or meta.get("estimated_print_time")
 
@@ -371,234 +302,31 @@ async def send_printer_command(printer_uuid: str, command: str, args: dict[str, 
     """
     endpoint = f"/printers/{printer_uuid}/commands"
 
-    # Build command payload
     payload: dict[str, Any] = {"command": command}
-
-    # Add args if provided
     if args:
         payload["args"] = args
 
     try:
-        cookies = _get_session_cookies()
-        async with httpx.AsyncClient(cookies=cookies, timeout=30.0) as client:
-            url = f"{PRUSA_API_BASE}{endpoint}"
+        headers = await _auth_headers({"Content-Type": "application/json"})
+    except LoginRequired as e:
+        return f"Not authenticated: {e}"
 
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            url = f"{PRUSA_API_BASE}{endpoint}"
             logger.info("Sending command to %s: %s", url, payload)
 
-            response = await client.post(
-                url,
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-            )
-
+            response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             result = response.json()
 
             return f"Command '{command}' sent successfully to printer {printer_uuid}.\nResponse: {json.dumps(result, indent=2)}"
-
     except httpx.HTTPStatusError as e:
         logger.exception("HTTP error sending command")
         return f"Failed to send command: HTTP {e.response.status_code} - {e.response.text}"
     except (httpx.RequestError, json.JSONDecodeError) as e:
         logger.exception("Error sending command")
         return f"Error sending command: {e!s}"
-
-
-def format_printer(printer: dict) -> str:
-    """Format a printer object into a readable string."""
-    status = f"""
-Printer Name: {printer.get("name", "Unknown")}
-Printer UUID: {printer.get("uuid", "Unknown")}
-Status: {printer.get("printer_state", "Unknown")}
-Connection: {printer.get("connect_state", "Unknown")}
-Type: {printer.get("printer_type_name", "Unknown")}
-Location: {printer.get("location", "Unknown")}
-"""
-
-    # Add temperature info if available
-    if "temp" in printer:
-        temp = printer["temp"]
-        status += f"""
-Temperature (Nozzle): {temp.get("temp_nozzle", "N/A")}°C (Target: {temp.get("target_nozzle", "N/A")}°C)
-Temperature (Bed): {temp.get("temp_bed", "N/A")}°C (Target: {temp.get("target_bed", "N/A")}°C)
-"""
-
-    # Add job info if printing
-    if "job_info" in printer:
-        job = printer["job_info"]
-        status += f"""
-Current Job: {job.get("display_name", "Unknown")}
-Progress: {job.get("progress", "N/A")}%
-Time Printing: {job.get("time_printing", 0)} seconds
-Time Remaining: {job.get("time_remaining", 0)} seconds
-"""
-
-    return status
-
-
-@mcp.tool()
-async def connect_login(email: str = "", password: str = "") -> str:
-    """Log in to Prusa Connect and persist session cookies to reuse later.
-
-    Args:
-        email: Prusa Connect email / username (optional if set in environment as PRUSA_EMAIL)
-        password: Prusa Connect password (optional if set in environment as PRUSA_PASSWORD)
-    """
-    try:
-        # Use provided credentials or fall back to environment variables
-        login_email = email or os.getenv("PRUSA_EMAIL")
-        login_password = password or os.getenv("PRUSA_PASSWORD")
-
-        if not login_email or not login_password:
-            return "Error: Email and password must be provided either as arguments or via PRUSA_EMAIL and PRUSA_PASSWORD environment variables."
-
-        await ensure_login(login_email, login_password)
-    except Exception as e:
-        logger.exception("Login failed")
-        return f"Login failed: {e!s}"
-    else:
-        return f"Successfully logged in and session saved to {STATE_FILE}"
-
-
-@mcp.tool()
-async def get_printers(limit: int = 10) -> str:
-    """Get list of Prusa printers.
-
-    Args:
-        limit: Maximum number of printers to return (default: 10)
-    """
-    endpoint = f"/printers?limit={limit}"
-    data = await make_prusa_request(endpoint)
-
-    if not data:
-        return "Unable to fetch printer data."
-
-    printers = data.get("printers", [])
-    logger.info(data)
-
-    if not printers:
-        return "No printers found."
-
-    formatted_printers = [format_printer(printer) for printer in printers]
-    return "\n---\n".join(formatted_printers)
-
-
-@mcp.tool()
-async def get_printer_status(printer_uuid: str) -> str:
-    """Get detailed status of a specific printer.
-
-    Args:
-        printer_uuid: The UUID of the printer
-    """
-    # First get all printers and find the one with matching UUID
-    endpoint = "/printers"
-    data = await make_prusa_request(endpoint)
-
-    if not data:
-        return "Unable to fetch printer data."
-
-    printers = data.get("printers", [])
-    printer = None
-
-    for p in printers:
-        if p.get("uuid") == printer_uuid or p.get("name") == printer_uuid:
-            printer = p
-            break
-
-    if not printer:
-        return f"Printer with UUID/name '{printer_uuid}' not found."
-
-    return format_printer(printer)
-
-
-@mcp.tool()
-async def get_printer_jobs(printer_uuid: str, limit: int = 5) -> str:
-    """Get recent jobs for a specific printer.
-
-    Args:
-        printer_uuid: The UUID of the printer
-        limit: Maximum number of jobs to return (default: 5)
-    """
-    # Note: Based on the API structure, you might need to adjust this endpoint
-    # The exact jobs endpoint format may differ - check Prusa Connect API docs
-    endpoint = f"/printers/{printer_uuid}/jobs?limit={limit}"
-    data = await make_prusa_request(endpoint)
-
-    if not data:
-        return f"Unable to fetch jobs for printer {printer_uuid}."
-
-    # Adjust based on actual API response structure
-    jobs = data.get("jobs", []) or data.get("data", [])
-
-    if not jobs:
-        return "No jobs found for this printer."
-
-    formatted_jobs = []
-    for job in jobs:
-        # Basic job fields
-        job_id = job.get("id", "Unknown")
-        file_name = job.get("display_name") or job.get("file_name") or "Unknown"
-        status = job.get("status") or job.get("state") or "Unknown"
-        started = job.get("started_at") or job.get("start") or "Unknown"
-        completed = job.get("completed_at") or "N/A"
-        progress = job.get("progress", "N/A")
-
-        # Prefer `preview_url` if provided by the API; otherwise try other common fields
-        file_obj = job.get("file") or {}
-        preview = (
-            job.get("preview_url")
-            or job.get("display_path")
-            or job.get("display_url")
-            or file_obj.get("preview_url")
-            or file_obj.get("display_path")
-            or file_obj.get("display_url")
-            or job.get("thumbnail")
-            or job.get("preview")
-        )
-
-        # Normalize preview to a full absolute URL.
-        # Cases handled:
-        # - full http/https URLs: keep as-is
-        # - protocol-relative URLs (//...): prefix with https:
-        # - paths starting with /app: use PRUSA_API_BASE to avoid duplicating /app
-        # - other paths starting with /: prefix with CONNECT_URL
-        # - relative paths: prefix with CONNECT_URL
-        if preview:
-            try:
-                p = str(preview).strip()
-                # already absolute
-                if p.startswith(("http://", "https://")):
-                    preview = p
-                elif p.startswith("//"):
-                    preview = "https:" + p
-                elif p.startswith("/app"):
-                    # PRUSA_API_BASE already contains '/app'
-                    preview = PRUSA_API_BASE.rstrip("/") + p[len("/app") :]
-                elif p.startswith("/"):
-                    preview = CONNECT_URL.rstrip("/") + p
-                else:
-                    # generic relative path
-                    preview = CONNECT_URL.rstrip("/") + "/" + p.lstrip("/")
-            except (ValueError, AttributeError):
-                # If normalization fails, leave preview unchanged
-                pass
-
-        # Don't include preview in output as it doesn't render properly in Streamlit
-        job_info = f"""
-Job ID: {job_id}
-File: {file_name}
-Status: {status}
-Started: {started}
-Completed: {completed}
-Progress: {progress}%
-"""
-
-        formatted_jobs.append(job_info)
-
-    return "\n---\n".join(formatted_jobs)
 
 
 @mcp.tool()
@@ -628,10 +356,8 @@ async def get_printer_events(printer_uuid: str, limit: int = 100) -> str:
         server_time = e.get("server_time")
         data_field = e.get("data")
 
-        # Short representation of data if present
         data_repr = None
         if isinstance(data_field, dict):
-            # pick a few keys to show
             keys = [k for k in ("target_nozzle", "target_bed", "path", "size") if k in data_field]
             if keys:  # noqa: SIM108
                 data_repr = ", ".join(f"{k}={data_field[k]}" for k in keys)
@@ -647,8 +373,44 @@ async def get_printer_events(printer_uuid: str, limit: int = 100) -> str:
     return "\n".join(lines)
 
 
-def main():
-    """Initialize and run the MCP server."""
+# ----------------------------
+# Formatting helpers
+# ----------------------------
+def format_printer(printer: dict) -> str:
+    """Format a printer object into a readable string."""
+    status = f"""
+Printer Name: {printer.get("name", "Unknown")}
+Printer UUID: {printer.get("uuid", "Unknown")}
+Status: {printer.get("printer_state", "Unknown")}
+Connection: {printer.get("connect_state", "Unknown")}
+Type: {printer.get("printer_type_name", "Unknown")}
+Location: {printer.get("location", "Unknown")}
+"""
+
+    if "temp" in printer:
+        temp = printer["temp"]
+        status += f"""
+Temperature (Nozzle): {temp.get("temp_nozzle", "N/A")}°C (Target: {temp.get("target_nozzle", "N/A")}°C)
+Temperature (Bed): {temp.get("temp_bed", "N/A")}°C (Target: {temp.get("target_bed", "N/A")}°C)
+"""
+
+    if "job_info" in printer:
+        job = printer["job_info"]
+        status += f"""
+Current Job: {job.get("display_name", "Unknown")}
+Progress: {job.get("progress", "N/A")}%
+Time Printing: {job.get("time_printing", 0)} seconds
+Time Remaining: {job.get("time_remaining", 0)} seconds
+"""
+
+    return status
+
+
+# ----------------------------
+# Entry point
+# ----------------------------
+def main() -> None:
+    """Initialize and run the MCP server over stdio."""
     mcp.run(transport="stdio")
 
 
