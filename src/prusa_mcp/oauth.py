@@ -319,9 +319,7 @@ async def _refresh(refresh_token: str) -> dict[str, Any]:
         _save_tokens(new_tokens)
     else:
         logger.info("Token file was removed during refresh; not persisting new tokens.")
-        raise LoginRequired(
-            "Token file was cleared during refresh. Run `prusa-mcp login` to re-authenticate."
-        )
+        raise LoginRequired("Token file was cleared during refresh. Run `prusa-mcp login` to re-authenticate.")
     return new_tokens
 
 
