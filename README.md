@@ -52,7 +52,7 @@ All environment variables are optional:
 | `PRUSA_TOKEN_FILE` | `~/.config/prusa-mcp/tokens.json` | Path to the OAuth token file |
 | `PRUSA_OAUTH_CLIENT_ID` | *(PrusaSlicer client)* | Override the public OAuth client id |
 
-You can create a `.env` file from `.env.example` to set these.
+Set these in your shell environment before running the server (e.g. `export PRUSA_CONNECT_URL=...`).
 
 ## Usage
 

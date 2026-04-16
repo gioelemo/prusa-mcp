@@ -52,7 +52,7 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
     try:
         headers = await _auth_headers()
     except LoginRequired:
-        logger.exception("Not authenticated")
+        logger.warning("Not authenticated; run `prusa-mcp login` and try again")
         return None
 
     async with httpx.AsyncClient() as client:
