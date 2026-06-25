@@ -15,6 +15,7 @@ MCP server for interacting with Prusa Connect via OAuth2 (Authorization Code + P
 - **File & Storage Management**: Browse printer files and storage devices
 - **Printer Commands**: Send commands directly to printers (pause, resume, temperature, etc.) — see the full [command reference](supported_command.md)
 - **Event Monitoring**: Fetch recent printer events
+- **Slice & Print**: Slice an STL locally with the PrusaSlicer CLI, then upload and (optionally) print it via the Connect cloud — so the whole pipeline works even on restricted networks where only `connect.prusa3d.com` is reachable and local PrusaLink is blocked
 
 ## Installation
 
@@ -53,6 +54,8 @@ All environment variables are optional:
 | `PRUSA_ACCOUNT_URL` | `https://account.prusa3d.com` | Base URL for Prusa Account (OAuth) |
 | `PRUSA_TOKEN_FILE` | `~/.config/prusa-mcp/tokens.json` | Path to the OAuth token file |
 | `PRUSA_OAUTH_CLIENT_ID` | *(PrusaSlicer client)* | Override the public OAuth client id |
+| `PRUSA_TEAM_ID` | *(auto-discovered)* | Connect team id used for uploads. Read it from the Connect upload URL `/app/users/teams/<id>/uploads`; if unset, it is looked up from the printer detail |
+| `PRUSASLICER_CLI` | `prusa-slicer` | PrusaSlicer binary used for local slicing (macOS: `/Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer`) |
 
 Set these in your shell environment before running the server (e.g. `export PRUSA_CONNECT_URL=...`).
 
@@ -151,6 +154,40 @@ Fetch recent events for a printer.
 | `printer_uuid` | string | Yes | UUID of the printer |
 | `limit` | int | No | Max events to return (default: 100) |
 
+### Slice & Print Tools
+
+These take an STL all the way to a running print over the Connect cloud. Slicing is local (needs a PrusaSlicer install — see `PRUSASLICER_CLI`); upload and print use the cloud API, so they work where local PrusaLink is blocked.
+
+#### `slice_stl`
+Slice a local STL into g-code/bgcode with the PrusaSlicer CLI. Runs entirely on the host — no network.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `stl_path` | string | Yes | Path to the input `.stl` |
+| `config_ini` | string | Yes | Exported PrusaSlicer config bundle (File → Export → Export Config) |
+| `output_path` | string | No | Output file (default: STL name with a `.bgcode` extension) |
+
+#### `upload_gcode`
+Upload a sliced g-code/bgcode file to a printer via the Connect cloud, optionally starting the print.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Local path to the `.bgcode`/`.gcode` file |
+| `printer_uuid` | string | Yes | Target printer UUID |
+| `team_id` | string | No | Connect team id (defaults to `PRUSA_TEAM_ID` or auto-discovery) |
+| `start_print` | bool | No | If true, `START_PRINT` the uploaded file (default: false) |
+
+#### `slice_and_print`
+One-shot: slice an STL, upload it, and (by default) start the print.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `stl_path` | string | Yes | Path to the input `.stl` |
+| `printer_uuid` | string | Yes | Target printer UUID |
+| `config_ini` | string | Yes | Exported PrusaSlicer config bundle |
+| `team_id` | string | No | Connect team id (defaults to `PRUSA_TEAM_ID` or auto-discovery) |
+| `start_print` | bool | No | Start the print after upload (default: true) |
+
 ## Security Notes
 
 - **Token File**: The refresh and access tokens are stored in `PRUSA_TOKEN_FILE` (default `~/.config/prusa-mcp/tokens.json`), written with `0600` permissions. Treat this file like a password — anyone with a copy can act as you against Prusa Connect until the refresh token is revoked.
@@ -174,3 +211,14 @@ Fetch recent events for a printer.
 - **Linux: `ImportError` about `gi` / `webkit2`**: Install the system WebKit2GTK bindings: `apt install gir1.2-webkit2-4.1 libgirepository1.0-dev` (Debian/Ubuntu) or the equivalent for your distribution.
 - **Docker**: Run `prusa-mcp login` on the host, not inside the container. Point `PRUSA_TOKEN_FILE` at a path inside a volume mounted into both host and container.
 - **TLS / certificate errors behind a proxy**: `httpx2` validates against the OS trust store (via `truststore`) instead of the bundled `certifi` roots. Import your proxy's CA into the system trust store, or point `SSL_CERT_FILE` / `SSL_CERT_DIR` at it.
+
+## Development
+
+```bash
+uv sync --extra dev      # install dev tools (ruff, mypy, pytest)
+uv run pytest            # run the test suite
+uv run ruff check .      # lint
+uv run ruff format .     # format
+```
+
+The tests fake all network calls and use a tiny stub slicer, so they run offline with no Prusa credentials and never touch a real printer.
