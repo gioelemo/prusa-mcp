@@ -8,9 +8,13 @@ happens out-of-band via the ``prusa-mcp login`` CLI subcommand.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+from pathlib import Path
+import shutil
+import subprocess
 from typing import Any
 
 import httpx2
@@ -33,6 +37,17 @@ logger = logging.getLogger(__name__)
 # ----------------------------
 CONNECT_URL = os.environ.get("PRUSA_CONNECT_URL", "https://connect.prusa3d.com")
 PRUSA_API_BASE = CONNECT_URL.rstrip("/") + "/app"
+
+# Default Connect team id for uploads. It is NOT exposed by /api/v1/me or the
+# printer list; read it once from the Connect web app upload URL
+# (``/app/users/teams/<TEAM_ID>/uploads``) and set it here via env, or pass it
+# per-call. Tools also attempt to auto-discover it from the printer detail.
+DEFAULT_TEAM_ID = os.environ.get("PRUSA_TEAM_ID", "")
+
+# PrusaSlicer CLI used for local slicing (STL -> g-code/bgcode). Override with
+# the full binary path when it isn't on PATH, e.g. on macOS:
+#   /Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer
+PRUSASLICER_CLI = os.environ.get("PRUSASLICER_CLI", "prusa-slicer")
 
 
 # ----------------------------
@@ -375,6 +390,206 @@ async def get_printer_events(printer_uuid: str, limit: int = 100) -> str:
         lines.append(line)
 
     return "\n".join(lines)
+
+
+# ----------------------------
+# Slicing + cloud upload (STL -> g-code -> printer, all via Prusa Connect)
+# ----------------------------
+def _slice_to_gcode(stl_path: str, config_ini: str, output_path: str = "") -> tuple[str, int, str]:
+    """Slice an STL via the PrusaSlicer CLI. Returns ``(output_path, size, stl_name)``.
+
+    Blocking (filesystem + subprocess); call via ``asyncio.to_thread`` from async
+    tools so the event loop stays free. Raises ``FileNotFoundError`` when inputs
+    are missing and ``RuntimeError`` on a missing CLI or slicer failure.
+    """
+    stl = Path(stl_path).expanduser()
+    cfg = Path(config_ini).expanduser()
+    if not stl.is_file():
+        raise FileNotFoundError(f"STL not found: {stl}")
+    if not cfg.is_file():
+        raise FileNotFoundError(f"Config bundle not found: {cfg}")
+    out = Path(output_path).expanduser() if output_path else stl.with_suffix(".bgcode")
+
+    cli = shutil.which(PRUSASLICER_CLI) or PRUSASLICER_CLI
+    cmd = [cli, "--load", str(cfg), "--export-gcode", "--output", str(out), str(stl)]
+    logger.info("Slicing: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"PrusaSlicer CLI not found ('{PRUSASLICER_CLI}'). Install PrusaSlicer or set "
+            "PRUSASLICER_CLI to its binary path."
+        ) from e
+    if proc.returncode != 0:
+        raise RuntimeError(f"PrusaSlicer exited {proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}")
+    if not out.is_file():
+        raise RuntimeError(
+            f"Slicer reported success but produced no file at {out}; "
+            f"check the profile's output/extension settings. {proc.stdout.strip()}"
+        )
+    return str(out), out.stat().st_size, stl.name
+
+
+def _read_file(file_path: str) -> tuple[str, int, bytes]:
+    """Read a local file, returning ``(name, size, bytes)``.
+
+    Blocking; call via ``asyncio.to_thread``. Raises ``FileNotFoundError`` when
+    the path is not a regular file.
+    """
+    p = Path(file_path).expanduser()
+    if not p.is_file():
+        raise FileNotFoundError(f"File not found: {p}")
+    data = p.read_bytes()
+    return p.name, len(data), data
+
+
+async def _resolve_team_id(printer_uuid: str, team_id: str = "") -> str | None:
+    """Resolve a team_id from the arg, the ``PRUSA_TEAM_ID`` env, or the printer detail."""
+    if team_id:
+        return team_id
+    if DEFAULT_TEAM_ID:
+        return DEFAULT_TEAM_ID
+    data = await make_prusa_request(f"/printers/{printer_uuid}")
+    if data:
+        tid = data.get("team_id") or (data.get("printer") or {}).get("team_id")
+        if tid:
+            return str(tid)
+    return None
+
+
+async def _upload_bytes(name: str, size: int, data: bytes, team_id: str, printer_uuid: str) -> dict[str, Any]:
+    """Two-step Connect cloud upload: register the file, then PUT the raw bytes.
+
+    Returns the registration response, which includes the on-printer ``path``
+    used by START_PRINT. Mirrors PrusaSlicer's ``PrusaConnectNew`` upload flow.
+    """
+    async with httpx2.AsyncClient(timeout=300.0) as client:
+        # 1) Register the upload and reserve an id.
+        reg = await client.post(
+            f"{PRUSA_API_BASE}/users/teams/{team_id}/uploads",
+            headers=await _auth_headers({"Content-Type": "application/json"}),
+            json={"filename": name, "printer_uuid": printer_uuid, "size": size},
+        )
+        reg.raise_for_status()
+        info = reg.json()
+        upload_id = info.get("id")
+        if upload_id is None:
+            raise RuntimeError(f"Upload registration returned no 'id': {info}")
+
+        # 2) PUT the raw file body. Send both the slicer's Content-Type and the
+        #    web app's ``upload-size`` header for maximum server compatibility.
+        put = await client.put(
+            f"{PRUSA_API_BASE}/teams/{team_id}/files/raw",
+            params={"upload_id": upload_id},
+            headers=await _auth_headers({"Content-Type": "text/x.gcode", "upload-size": str(size)}),
+            content=data,
+        )
+        put.raise_for_status()
+    return info
+
+
+@mcp.tool()
+async def slice_stl(stl_path: str, config_ini: str, output_path: str = "") -> str:
+    """Slice a local STL into printable g-code/bgcode with the PrusaSlicer CLI.
+
+    Runs entirely on the machine hosting this server — no network needed, so it
+    works on restricted networks. Requires a local PrusaSlicer install; set the
+    ``PRUSASLICER_CLI`` env var to the binary if it isn't on PATH (macOS:
+    ``/Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer``).
+
+    Args:
+        stl_path: Path to the input ``.stl``.
+        config_ini: Path to an exported PrusaSlicer config bundle
+            (PrusaSlicer -> File -> Export -> Export Config) selecting the
+            printer, filament and print settings.
+        output_path: Optional output file. Defaults to the STL name with a
+            ``.bgcode`` extension, beside the input.
+    """
+    try:
+        out_path, size, stl_name = await asyncio.to_thread(_slice_to_gcode, stl_path, config_ini, output_path)
+    except FileNotFoundError as e:
+        return str(e)
+    except RuntimeError as e:
+        return f"Slicing failed: {e}"
+    return f"Sliced {stl_name} -> {out_path} ({size} bytes)"
+
+
+@mcp.tool()
+async def upload_gcode(file_path: str, printer_uuid: str, team_id: str = "", *, start_print: bool = False) -> str:
+    """Upload a sliced g-code/bgcode file to a printer via the Prusa Connect cloud.
+
+    Works where only Connect (not local PrusaLink) is reachable. Uploads to the
+    printer's storage and, optionally, starts the print immediately.
+
+    Args:
+        file_path: Local path to the ``.bgcode``/``.gcode`` file.
+        printer_uuid: Target printer UUID.
+        team_id: Connect team id. Defaults to the ``PRUSA_TEAM_ID`` env var, or is
+            auto-discovered from the printer when possible. (Find it in the
+            Connect upload URL: ``/app/users/teams/<TEAM_ID>/uploads``.)
+        start_print: When true, issue START_PRINT for the uploaded file.
+    """
+    tid = await _resolve_team_id(printer_uuid, team_id)
+    if not tid:
+        return (
+            "Could not determine team_id. Pass team_id=... or set PRUSA_TEAM_ID "
+            "(find it in the Connect upload URL: /app/users/teams/<TEAM_ID>/uploads)."
+        )
+
+    try:
+        name, size, data = await asyncio.to_thread(_read_file, file_path)
+    except FileNotFoundError as e:
+        return str(e)
+
+    try:
+        info = await _upload_bytes(name, size, data, tid, printer_uuid)
+    except LoginRequired as e:
+        return f"Not authenticated: {e}"
+    except httpx2.HTTPStatusError as e:
+        return f"Upload failed: HTTP {e.response.status_code} - {e.response.text}"
+    except (httpx2.RequestError, RuntimeError, OSError) as e:
+        logger.exception("Upload failed")
+        return f"Upload failed: {e!s}"
+
+    remote_path = info.get("path")
+    msg = f"Uploaded {name} -> {remote_path} (state={info.get('state')}, id={info.get('id')})."
+    if start_print and remote_path:
+        printed = await send_printer_command(printer_uuid, "START_PRINT", {"path": remote_path})
+        msg = f"{msg}\n{printed}"
+    elif start_print:
+        msg = f"{msg}\nNo remote path returned by Connect; cannot START_PRINT automatically."
+    return msg
+
+
+@mcp.tool()
+async def slice_and_print(
+    stl_path: str,
+    printer_uuid: str,
+    config_ini: str,
+    team_id: str = "",
+    *,
+    start_print: bool = True,
+) -> str:
+    """One-shot: slice an STL locally, upload it to Connect, and optionally print.
+
+    Combines :func:`slice_stl` and :func:`upload_gcode`. The entire network
+    portion is Connect-only, so it works on restricted networks.
+
+    Args:
+        stl_path: Path to the input ``.stl``.
+        printer_uuid: Target printer UUID.
+        config_ini: Exported PrusaSlicer config bundle (see :func:`slice_stl`).
+        team_id: Connect team id (see :func:`upload_gcode`).
+        start_print: When true (default), START_PRINT after upload.
+    """
+    try:
+        out_path, _size, _name = await asyncio.to_thread(_slice_to_gcode, stl_path, config_ini)
+    except FileNotFoundError as e:
+        return str(e)
+    except RuntimeError as e:
+        return f"Slicing failed: {e}"
+
+    return await upload_gcode(out_path, printer_uuid, team_id=team_id, start_print=start_print)
 
 
 # ----------------------------
