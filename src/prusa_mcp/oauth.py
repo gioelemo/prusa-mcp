@@ -251,7 +251,7 @@ def login_interactive() -> dict[str, Any]:  # noqa: C901
             captured["error"] = "Timed out (5 min) waiting for the OAuth callback."
         try:
             win.destroy()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("webview destroy failed", exc_info=True)
 
     window = webview.create_window(

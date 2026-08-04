@@ -29,7 +29,11 @@ packages = ["src/prusa_mcp"]
 [project.optional-dependencies]
 dev = [
   "mypy",
-  "ruff",
+  # Pinned: ruff-action reads this table to pick the CI version, and falls back
+  # to "latest" when it finds no specifier. An unpinned ruff meant CI silently
+  # drifted ahead of local installs and disagreed about which noqa directives
+  # are still needed.
+  "ruff==0.16.1",
   "pre-commit",
 ]
 
