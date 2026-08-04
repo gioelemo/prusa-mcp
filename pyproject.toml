@@ -9,8 +9,10 @@ authors = [
     {name = "Gioele Molinari", email = "gioelemo@ethz.ch"}
 ]
 dependencies = [
-    "httpx>=0.28.1",
-    "mcp[cli]>=1.18.0",
+    # httpx2 replaces httpx: the MCP SDK moved to it in v2, and reusing the same
+    # client here keeps a single HTTP/TLS stack in the dependency tree.
+    "httpx2>=2.5.0",
+    "mcp[cli]>=2.0.0",
     "pywebview>=5.0",
 ]
 
@@ -128,7 +130,7 @@ exclude = [
 ]
 [[tool.mypy.overrides]]
 module = [
-    "httpx",
+    "httpx2",
     "webview",
 ]
 ignore_missing_imports = true
