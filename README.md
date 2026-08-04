@@ -25,6 +25,8 @@ uv sync
 
 That's it on macOS and Windows. On Linux, `pywebview` additionally needs the system WebKit2GTK libraries for the login window — on Debian/Ubuntu that's `apt install gir1.2-webkit2-4.1 libgirepository1.0-dev`. (The MCP server itself never opens a window, so this is only needed on the host where you run `prusa-mcp login`.)
 
+This server targets **MCP Python SDK v2** (`mcp>=2.0.0`), which speaks the current protocol revision. If you are upgrading from an older checkout, re-run `uv sync` — v2 replaces `httpx` with `httpx2` and drops the `mcp.server.fastmcp` module, so a stale environment will fail to import.
+
 ## Authentication
 
 Run this once, on a machine with a display:
@@ -171,3 +173,4 @@ Fetch recent events for a printer.
 - **Headless machines (no display)**: `prusa-mcp login` needs a windowed session to show the webview. Run the login on a desktop host (macOS, Windows, or Linux with X11/Wayland) and ship the resulting `tokens.json` to the headless machine via a mounted volume or `scp`.
 - **Linux: `ImportError` about `gi` / `webkit2`**: Install the system WebKit2GTK bindings: `apt install gir1.2-webkit2-4.1 libgirepository1.0-dev` (Debian/Ubuntu) or the equivalent for your distribution.
 - **Docker**: Run `prusa-mcp login` on the host, not inside the container. Point `PRUSA_TOKEN_FILE` at a path inside a volume mounted into both host and container.
+- **TLS / certificate errors behind a proxy**: `httpx2` validates against the OS trust store (via `truststore`) instead of the bundled `certifi` roots. Import your proxy's CA into the system trust store, or point `SSL_CERT_FILE` / `SSL_CERT_DIR` at it.

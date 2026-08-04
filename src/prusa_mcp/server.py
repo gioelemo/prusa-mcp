@@ -13,14 +13,18 @@ import logging
 import os
 from typing import Any
 
-import httpx
-from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+import httpx2
+from mcp.server.mcpserver import MCPServer  # type: ignore[import-not-found]
 
+from prusa_mcp import __version__
 from prusa_mcp.oauth import get_access_token
 from prusa_mcp.oauth import LoginRequired
 
-# Initialize FastMCP server
-mcp = FastMCP("prusa-printer")
+# Initialize the MCP server. Everything after ``name`` must be passed by keyword:
+# MCP SDK v2 inserted ``title``/``description`` ahead of ``instructions`` in the
+# positional order. ``version`` is also new — servers that omit it advertise an
+# empty version string to clients.
+mcp = MCPServer("prusa-printer", version=__version__)
 logger = logging.getLogger(__name__)
 
 
@@ -55,12 +59,12 @@ async def make_prusa_request(endpoint: str) -> dict[str, Any] | None:
         logger.warning("Not authenticated; run `prusa-mcp login` and try again")
         return None
 
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         try:
             response = await client.get(url, headers=headers, timeout=30.0)
             response.raise_for_status()
             return response.json()
-        except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError):
+        except (httpx2.HTTPStatusError, httpx2.RequestError, json.JSONDecodeError):
             logger.exception("API request failed for %s", url)
             return None
 
@@ -85,7 +89,7 @@ async def connect_login(email: str = "", password: str = "") -> str:  # noqa: AR
             "Not authenticated. Run `prusa-mcp login` (or `uv run prusa-mcp login`) "
             f"on a machine with a browser to authorize this server.\nDetails: {e}"
         )
-    except (httpx.HTTPError, RuntimeError) as e:
+    except (httpx2.HTTPError, RuntimeError) as e:
         logger.exception("Token refresh failed")
         return f"Authentication check failed: {e!s}"
     return "Authenticated — Prusa Connect tokens are valid and ready to use."
@@ -312,7 +316,7 @@ async def send_printer_command(printer_uuid: str, command: str, args: dict[str, 
         return f"Not authenticated: {e}"
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx2.AsyncClient(timeout=30.0) as client:
             url = f"{PRUSA_API_BASE}{endpoint}"
             logger.info("Sending command to %s: %s", url, payload)
 
@@ -321,10 +325,10 @@ async def send_printer_command(printer_uuid: str, command: str, args: dict[str, 
             result = response.json()
 
             return f"Command '{command}' sent successfully to printer {printer_uuid}.\nResponse: {json.dumps(result, indent=2)}"
-    except httpx.HTTPStatusError as e:
+    except httpx2.HTTPStatusError as e:
         logger.exception("HTTP error sending command")
         return f"Failed to send command: HTTP {e.response.status_code} - {e.response.text}"
-    except (httpx.RequestError, json.JSONDecodeError) as e:
+    except (httpx2.RequestError, json.JSONDecodeError) as e:
         logger.exception("Error sending command")
         return f"Error sending command: {e!s}"
 

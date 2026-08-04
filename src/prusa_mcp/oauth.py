@@ -28,7 +28,7 @@ import time
 from typing import Any
 import urllib.parse
 
-import httpx
+import httpx2
 
 logger = logging.getLogger(__name__)
 
@@ -251,7 +251,7 @@ def login_interactive() -> dict[str, Any]:  # noqa: C901
             captured["error"] = "Timed out (5 min) waiting for the OAuth callback."
         try:
             win.destroy()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("webview destroy failed", exc_info=True)
 
     window = webview.create_window(
@@ -280,7 +280,7 @@ def login_interactive() -> dict[str, Any]:  # noqa: C901
         "client_id": CLIENT_ID,
         "code_verifier": verifier,
     }
-    with httpx.Client(timeout=30.0) as client:
+    with httpx2.Client(timeout=30.0) as client:
         resp = client.post(TOKEN_URL, data=token_payload)
     if resp.status_code != 200:  # noqa: PLR2004
         raise RuntimeError(f"Token exchange failed: HTTP {resp.status_code} — {resp.text}")
@@ -301,7 +301,7 @@ async def _refresh(refresh_token: str) -> dict[str, Any]:
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx2.AsyncClient(timeout=30.0) as client:
         resp = await client.post(TOKEN_URL, data=payload)
     if resp.status_code != 200:  # noqa: PLR2004
         raise LoginRequired(
