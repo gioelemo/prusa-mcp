@@ -90,6 +90,18 @@ uv run prusa-mcp
 python -m prusa_mcp
 ```
 
+### Example script
+
+[`examples/print_stl.py`](examples/print_stl.py) drives the whole pipeline from the command line, without an MCP client:
+
+```bash
+uv run examples/print_stl.py --list                                    # show printers
+uv run examples/print_stl.py cube.stl --config lab_xl.ini              # slice, upload, print
+uv run examples/print_stl.py cube.bgcode --printer "Printer 1" --no-print   # upload only
+```
+
+It prompts before starting a print; pass `--yes` to skip that. `--auto-continue` additionally dismisses the printer's "unfinished selftest" warning (see `auto_continue_dialogs` below).
+
 ### Available Tools
 
 #### `connect_login`
