@@ -9,6 +9,8 @@ happens out-of-band via the ``prusa-mcp login`` CLI subcommand.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+from datetime import UTC
 import json
 import logging
 import os
@@ -170,6 +172,31 @@ async def get_printer_status(printer_uuid: str) -> str:
     return format_printer(printer)
 
 
+def _format_timestamp(value: Any) -> str:
+    """Render a Unix timestamp as a readable UTC datetime."""
+    try:
+        return datetime.fromtimestamp(float(value), tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "Unknown"
+
+
+def _format_duration(seconds: Any) -> str:
+    """Render a second count as ``2h 43m 16s``."""
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return "Unknown"
+    hours, rest = divmod(max(total, 0), 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if hours or minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
 @mcp.tool()
 async def get_printer_jobs(printer_uuid: str, limit: int = 5) -> str:
     """Get recent jobs for a specific printer.
@@ -184,59 +211,38 @@ async def get_printer_jobs(printer_uuid: str, limit: int = 5) -> str:
     if not data:
         return f"Unable to fetch jobs for printer {printer_uuid}."
 
-    jobs = data.get("jobs", []) or data.get("data", [])
+    jobs = data.get("jobs") or data.get("data") or []
 
     if not jobs:
         return "No jobs found for this printer."
 
     formatted_jobs = []
     for job in jobs:
-        job_id = job.get("id", "Unknown")
-        file_name = job.get("display_name") or job.get("file_name") or "Unknown"
-        status = job.get("status") or job.get("state") or "Unknown"
-        started = job.get("started_at") or job.get("start") or "Unknown"
-        completed = job.get("completed_at") or "N/A"
-        progress = job.get("progress", "N/A")
-
-        # Prefer `preview_url` if provided by the API; otherwise try other common fields
+        # The filename lives on the nested ``file`` object; the job itself only
+        # carries the printer's 8.3 short path (``/usb/CUBE20~1.BGC``).
         file_obj = job.get("file") or {}
-        preview = (
-            job.get("preview_url")
-            or job.get("display_path")
-            or job.get("display_url")
-            or file_obj.get("preview_url")
-            or file_obj.get("display_path")
-            or file_obj.get("display_url")
-            or job.get("thumbnail")
-            or job.get("preview")
-        )
+        name = file_obj.get("display_name") or file_obj.get("name") or job.get("path") or "Unknown"
 
-        # Normalize preview to a full absolute URL.
-        if preview:
-            try:
-                p = str(preview).strip()
-                if p.startswith(("http://", "https://")):
-                    preview = p
-                elif p.startswith("//"):
-                    preview = "https:" + p
-                elif p.startswith("/app"):
-                    preview = PRUSA_API_BASE.rstrip("/") + p[len("/app") :]
-                elif p.startswith("/"):
-                    preview = CONNECT_URL.rstrip("/") + p
-                else:
-                    preview = CONNECT_URL.rstrip("/") + "/" + p.lstrip("/")
-            except (ValueError, AttributeError):
-                pass
+        lines = [
+            f"Job ID: {job.get('id', 'Unknown')}",
+            f"File: {name}",
+            f"Status: {job.get('state') or job.get('status') or 'Unknown'}",
+            f"Started: {_format_timestamp(job.get('start'))}",
+        ]
+        start, end = job.get("start"), job.get("end")
+        if end:
+            lines.append(f"Ended: {_format_timestamp(end)}")
+        if start and end:
+            # Derived from the timestamps rather than the job's own
+            # ``time_printing``: on a job that was stopped early Connect leaves
+            # that field holding the *previous* job's value.
+            lines.append(f"Duration: {_format_duration(end - start)}")
+        # Only a running job reports progress; finished ones omit the field
+        # entirely, so don't render a meaningless "N/A%".
+        if job.get("progress") is not None:
+            lines.append(f"Progress: {job['progress']}%")
 
-        job_info = f"""
-Job ID: {job_id}
-File: {file_name}
-Status: {status}
-Started: {started}
-Completed: {completed}
-Progress: {progress}%
-"""
-        formatted_jobs.append(job_info)
+        formatted_jobs.append("\n".join(lines))
 
     return "\n---\n".join(formatted_jobs)
 

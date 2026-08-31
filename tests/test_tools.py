@@ -195,6 +195,84 @@ async def test_resolve_team_id_none(monkeypatch):
 
 
 # ----------------------------
+# get_printer_jobs
+# ----------------------------
+# Shaped like a real Connect job: the filename is nested under "file", the
+# timestamps are Unix epochs, and a finished job carries no "progress".
+_JOB = {
+    "id": 246,
+    "state": "FIN_STOPPED",
+    "path": "/usb/CUBE_T~1.BGC",
+    "start": 1788185986,
+    "end": 1788186031,
+    "time_printing": 760,
+    "file": {"name": "cube_tool3.bgcode", "display_name": "cube_tool3.bgcode"},
+}
+
+
+async def test_get_printer_jobs_formats_a_job(monkeypatch):
+    async def fake_req(endpoint):
+        assert endpoint == "/printers/uuid-1/jobs?limit=5"
+        return {"jobs": [_JOB]}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    out = await server.get_printer_jobs("uuid-1")
+
+    assert "File: cube_tool3.bgcode" in out  # not the 8.3 path, not "Unknown"
+    assert "Status: FIN_STOPPED" in out
+    assert "Started: 2026-08-31 14:19:46 UTC" in out  # not a raw epoch
+    assert "Ended: 2026-08-31 14:20:31 UTC" in out  # "end", not "completed_at"
+    # Duration comes from the timestamps (45s), NOT time_printing (760s), which
+    # holds the previous job's value on a job that was stopped early.
+    assert "Duration: 45s" in out
+    assert "12m 40s" not in out
+    # A finished job has no progress; don't render a meaningless "N/A%".
+    assert "Progress" not in out
+
+
+async def test_get_printer_jobs_shows_progress_only_when_present(monkeypatch):
+    async def fake_req(endpoint):
+        return {"jobs": [{**_JOB, "state": "PRINTING", "end": None, "progress": 35.0}]}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    out = await server.get_printer_jobs("uuid-1")
+
+    assert "Progress: 35.0%" in out
+    assert "Ended" not in out
+    assert "Duration" not in out
+
+
+async def test_get_printer_jobs_falls_back_to_path(monkeypatch):
+    async def fake_req(endpoint):
+        return {"jobs": [{"id": 1, "path": "/usb/ONLY~1.BGC"}]}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    assert "File: /usb/ONLY~1.BGC" in await server.get_printer_jobs("uuid-1")
+
+
+async def test_get_printer_jobs_empty(monkeypatch):
+    async def fake_req(endpoint):
+        return {"jobs": []}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    assert "No jobs found" in await server.get_printer_jobs("uuid-1")
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(0, "0s"), (45, "45s"), (760, "12m 40s"), (9796, "2h 43m 16s"), (3600, "1h 0m 0s")],
+)
+def test_format_duration(seconds, expected):
+    assert server._format_duration(seconds) == expected
+
+
+@pytest.mark.parametrize("bad", [None, "", "not-a-number"])
+def test_format_timestamp_and_duration_survive_junk(bad):
+    assert server._format_timestamp(bad) == "Unknown"
+    assert server._format_duration(bad) == "Unknown"
+
+
+# ----------------------------
 # get_printer_tools
 # ----------------------------
 # Shaped like a real Prusa XL: five tools, a different filament in each.
