@@ -27,6 +27,30 @@ def _resp(method: str, url: str, status: int, data: dict) -> httpx2.Response:
     return httpx2.Response(status, json=data, request=httpx2.Request(method, url))
 
 
+# The printer's USB is FAT-formatted, so Connect reports both the long display
+# name and the 8.3 short path that START_PRINT actually resolves.
+_PRINTER_FILE = {
+    "name": "model.bgcode",
+    "display_name": "model.bgcode",
+    "path": "/usb/MODEL~1.BGC",
+    "display_path": "/usb/model.bgcode",
+}
+
+_DIALOG = {
+    "id": 42,
+    "code": "17801",
+    "key": "UNFINISHED_SELFTEST",
+    "title": "Warning",
+    "text": "Please complete Calibrations & Tests before using the printer.",
+    "buttons": ["Continue", "Abort"],
+}
+
+
+async def _fake_files_listing(endpoint: str) -> dict:
+    """Stand-in for make_prusa_request returning one file on the printer."""
+    return {"files": [_PRINTER_FILE]}
+
+
 def _patch_httpx(monkeypatch, *, post_status: int = 200, post_json: dict | None = None) -> dict:
     """Patch ``server.httpx2.AsyncClient`` with a fake; return a record of the calls."""
     rec: dict = {}
@@ -193,6 +217,7 @@ async def test_upload_gcode_registers_and_puts(monkeypatch, bgcode_file):
 async def test_upload_gcode_start_print(monkeypatch, bgcode_file):
     _patch_httpx(monkeypatch)
     monkeypatch.setattr(server, "_auth_headers", _fake_auth_headers)
+    monkeypatch.setattr(server, "make_prusa_request", _fake_files_listing)
     captured: dict = {}
 
     async def fake_cmd(printer_uuid, command, args=None):
@@ -203,8 +228,92 @@ async def test_upload_gcode_start_print(monkeypatch, bgcode_file):
 
     msg = await server.upload_gcode(str(bgcode_file), "uuid-2", team_id="t1", start_print=True)
 
-    assert captured == {"printer_uuid": "uuid-2", "command": "START_PRINT", "args": {"path": "/usb/model.bgcode"}}
+    # START_PRINT must use the printer's own 8.3 short path, not the long name
+    # Connect echoes back from the upload registration.
+    assert captured == {
+        "printer_uuid": "uuid-2",
+        "command": "START_PRINT",
+        "args": {"path": "/usb/MODEL~1.BGC"},
+    }
     assert "Command 'START_PRINT' sent successfully" in msg
+
+
+async def test_send_printer_command_sends_kwargs_not_args(monkeypatch):
+    """Connect rejects ``args`` with MISSING_COMMAND_ARGUMENT; it requires ``kwargs``."""
+    rec = _patch_httpx(monkeypatch)
+    monkeypatch.setattr(server, "_auth_headers", _fake_auth_headers)
+
+    await server.send_printer_command("uuid-1", "START_PRINT", {"path": "/usb/MODEL~1.BGC"})
+
+    assert rec["post"]["json"] == {"command": "START_PRINT", "kwargs": {"path": "/usb/MODEL~1.BGC"}}
+    assert "args" not in rec["post"]["json"]
+
+
+async def test_send_printer_command_without_args_omits_kwargs(monkeypatch):
+    rec = _patch_httpx(monkeypatch)
+    monkeypatch.setattr(server, "_auth_headers", _fake_auth_headers)
+
+    await server.send_printer_command("uuid-1", "PAUSE_PRINT")
+
+    assert rec["post"]["json"] == {"command": "PAUSE_PRINT"}
+
+
+# ----------------------------
+# _wait_for_printer_file
+# ----------------------------
+async def test_wait_for_printer_file_returns_short_path(monkeypatch):
+    monkeypatch.setattr(server, "make_prusa_request", _fake_files_listing)
+    assert await server._wait_for_printer_file("uuid", "model.bgcode") == "/usb/MODEL~1.BGC"
+
+
+async def test_wait_for_printer_file_times_out(monkeypatch):
+    async def empty(endpoint):
+        return {"files": []}
+
+    monkeypatch.setattr(server, "make_prusa_request", empty)
+    monkeypatch.setattr(server, "FILE_POLL_INTERVAL_SECONDS", 0)
+    assert await server._wait_for_printer_file("uuid", "gone.bgcode", timeout_seconds=0.01) is None
+
+
+# ----------------------------
+# _auto_continue_dialog (targeted, opt-in)
+# ----------------------------
+async def test_auto_continue_dialog_confirms_allow_listed_key(monkeypatch):
+    async def fake_req(endpoint):
+        return {"dialog_info": _DIALOG}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    captured: dict = {}
+
+    async def fake_cmd(printer_uuid, command, args=None):
+        captured.update(command=command, args=args)
+        return "ok"
+
+    monkeypatch.setattr(server, "send_printer_command", fake_cmd)
+
+    out = await server._auto_continue_dialog("uuid", {"UNFINISHED_SELFTEST"})
+
+    assert captured == {"command": "DIALOG_ACTION", "args": {"dialog_id": 42, "button": "Continue"}}
+    assert "Auto-confirmed" in out
+
+
+async def test_auto_continue_dialog_leaves_unlisted_dialog_alone(monkeypatch):
+    """A safety dialog must never be auto-confirmed just because auto-continue is on."""
+
+    async def fake_req(endpoint):
+        return {"dialog_info": {**_DIALOG, "key": "FILAMENT_RUNOUT"}}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+
+    async def boom(*args, **kwargs):
+        raise AssertionError("must not confirm a dialog outside the allow-list")
+
+    monkeypatch.setattr(server, "send_printer_command", boom)
+
+    out = await server._auto_continue_dialog("uuid", {"UNFINISHED_SELFTEST"})
+
+    assert "FILAMENT_RUNOUT" in out
+    assert "leaving it for a human" in out
 
 
 async def test_upload_gcode_http_error(monkeypatch, bgcode_file):
@@ -261,12 +370,17 @@ async def test_slice_and_print_chains(monkeypatch, fake_slicer):
 
     monkeypatch.setattr(server, "send_printer_command", fake_cmd)
 
+    async def fake_files(endpoint):
+        return {"files": [{"display_name": "s.bgcode", "name": "s.bgcode", "path": "/usb/S~1.BGC"}]}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_files)
+
     msg = await server.slice_and_print(str(stl), "uuid-9", str(cfg), team_id="t2")
 
     # Sliced output got uploaded...
     assert rec["post"]["json"]["filename"] == "s.bgcode"
     assert rec["post"]["json"]["size"] == len(b"GCODE")
-    # ...and START_PRINT fired with the path from the register response.
+    # ...and START_PRINT fired with the printer's own short path for it.
     assert captured["command"] == "START_PRINT"
-    assert captured["args"] == {"path": "/usb/model.bgcode"}
+    assert captured["args"] == {"path": "/usb/S~1.BGC"}
     assert "started" in msg

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import time
 from typing import Any
 
 import httpx2
@@ -48,6 +49,15 @@ DEFAULT_TEAM_ID = os.environ.get("PRUSA_TEAM_ID", "")
 # the full binary path when it isn't on PATH, e.g. on macOS:
 #   /Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer
 PRUSASLICER_CLI = os.environ.get("PRUSASLICER_CLI", "prusa-slicer")
+
+# Connect accepts an upload before the file has reached the printer, so
+# START_PRINT has to wait for it to land on the printer's own storage.
+FILE_APPEAR_TIMEOUT_SECONDS = 120.0
+FILE_POLL_INTERVAL_SECONDS = 2.0
+
+# A blocking dialog shows up a moment after START_PRINT, not instantly.
+DIALOG_WAIT_SECONDS = 15.0
+DIALOG_POLL_INTERVAL_SECONDS = 1.5
 
 
 # ----------------------------
@@ -323,7 +333,9 @@ async def send_printer_command(printer_uuid: str, command: str, args: dict[str, 
 
     payload: dict[str, Any] = {"command": command}
     if args:
-        payload["args"] = args
+        # Connect expects command arguments under "kwargs"; sending "args"
+        # is rejected with MISSING_COMMAND_ARGUMENT even when the key is present.
+        payload["kwargs"] = args
 
     try:
         headers = await _auth_headers({"Content-Type": "application/json"})
@@ -514,8 +526,87 @@ async def slice_stl(stl_path: str, config_ini: str, output_path: str = "") -> st
     return f"Sliced {stl_name} -> {out_path} ({size} bytes)"
 
 
+async def _wait_for_printer_file(
+    printer_uuid: str, name: str, timeout_seconds: float = FILE_APPEAR_TIMEOUT_SECONDS
+) -> str | None:
+    """Wait for an uploaded file to land on the printer, returning its real path.
+
+    Two things make the upload response's ``path`` unusable for START_PRINT: the
+    transfer to the printer is not instant, and the printer's FAT storage
+    addresses files by 8.3 short name (``/usb/CUBE20~1.BGC``) while Connect
+    reports the long name (``/usb/cube20.bgcode``). Polling the printer's own
+    file list solves both — the ``path`` field there is what START_PRINT
+    resolves, and its presence proves the transfer finished.
+
+    Returns ``None`` if the file has not appeared before ``timeout_seconds``.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        data = await make_prusa_request(f"/printers/{printer_uuid}/files?limit=200")
+        for entry in (data or {}).get("files") or []:
+            if name in (entry.get("display_name"), entry.get("name")):
+                return entry.get("path") or entry.get("display_path")
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(FILE_POLL_INTERVAL_SECONDS)
+
+
+async def _auto_continue_dialog(printer_uuid: str, allowed_keys: set[str]) -> str | None:
+    """Press ``Continue`` on a blocking dialog, but only for allow-listed keys.
+
+    Dialogs carry a stable ``key`` (e.g. ``UNFINISHED_SELFTEST``). Only keys the
+    caller named explicitly are confirmed: the same channel carries
+    filament-runout, thermal-anomaly and crash-detected dialogs, where blindly
+    confirming would turn a stopped printer into a damaged one.
+
+    Returns a description of what happened, or ``None`` when no dialog appeared.
+    """
+    deadline = time.monotonic() + DIALOG_WAIT_SECONDS
+    while True:
+        data = await make_prusa_request(f"/printers/{printer_uuid}")
+        dialog = (data or {}).get("dialog_info") or {}
+        key = dialog.get("key")
+        if key and key in allowed_keys and "Continue" in (dialog.get("buttons") or []):
+            result = await send_printer_command(
+                printer_uuid, "DIALOG_ACTION", {"dialog_id": dialog.get("id"), "button": "Continue"}
+            )
+            return f"Auto-confirmed dialog {key} (code {dialog.get('code')}): {result}"
+        if key:
+            return (
+                f"Printer is showing dialog {key} (code {dialog.get('code')}): "
+                f"{dialog.get('text') or ''} — not in auto_continue_dialogs, leaving it for a human."
+            )
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(DIALOG_POLL_INTERVAL_SECONDS)
+
+
+async def _start_uploaded_print(printer_uuid: str, name: str, auto_continue_dialogs: list[str] | None = None) -> str:
+    """START_PRINT a freshly uploaded file once it lands, clearing allowed dialogs."""
+    printer_path = await _wait_for_printer_file(printer_uuid, name)
+    if not printer_path:
+        return (
+            f"File has not appeared on the printer within "
+            f"{FILE_APPEAR_TIMEOUT_SECONDS:.0f}s; cannot START_PRINT automatically."
+        )
+
+    result = await send_printer_command(printer_uuid, "START_PRINT", {"path": printer_path})
+    if auto_continue_dialogs:
+        dialog_msg = await _auto_continue_dialog(printer_uuid, set(auto_continue_dialogs))
+        if dialog_msg:
+            result = f"{result}\n{dialog_msg}"
+    return result
+
+
 @mcp.tool()
-async def upload_gcode(file_path: str, printer_uuid: str, team_id: str = "", *, start_print: bool = False) -> str:
+async def upload_gcode(
+    file_path: str,
+    printer_uuid: str,
+    team_id: str = "",
+    auto_continue_dialogs: list[str] | None = None,
+    *,
+    start_print: bool = False,
+) -> str:
     """Upload a sliced g-code/bgcode file to a printer via the Prusa Connect cloud.
 
     Works where only Connect (not local PrusaLink) is reachable. Uploads to the
@@ -527,6 +618,11 @@ async def upload_gcode(file_path: str, printer_uuid: str, team_id: str = "", *, 
         team_id: Connect team id. Defaults to the ``PRUSA_TEAM_ID`` env var, or is
             auto-discovered from the printer when possible. (Find it in the
             Connect upload URL: ``/app/users/teams/<TEAM_ID>/uploads``.)
+        auto_continue_dialogs: Dialog keys to confirm automatically when they
+            block the print, e.g. ``["UNFINISHED_SELFTEST"]``. Empty by default:
+            only keys named here are confirmed, because the same channel carries
+            filament-runout, thermal-anomaly and crash-detected dialogs that must
+            be seen by a human. Any other dialog is reported and left alone.
         start_print: When true, issue START_PRINT for the uploaded file.
     """
     tid = await _resolve_team_id(printer_uuid, team_id)
@@ -551,22 +647,19 @@ async def upload_gcode(file_path: str, printer_uuid: str, team_id: str = "", *, 
         logger.exception("Upload failed")
         return f"Upload failed: {e!s}"
 
-    remote_path = info.get("path")
-    msg = f"Uploaded {name} -> {remote_path} (state={info.get('state')}, id={info.get('id')})."
-    if start_print and remote_path:
-        printed = await send_printer_command(printer_uuid, "START_PRINT", {"path": remote_path})
-        msg = f"{msg}\n{printed}"
-    elif start_print:
-        msg = f"{msg}\nNo remote path returned by Connect; cannot START_PRINT automatically."
+    msg = f"Uploaded {name} -> {info.get('path')} (state={info.get('state')}, id={info.get('id')})."
+    if start_print:
+        msg = f"{msg}\n{await _start_uploaded_print(printer_uuid, name, auto_continue_dialogs)}"
     return msg
 
 
 @mcp.tool()
-async def slice_and_print(
+async def slice_and_print(  # noqa: PLR0913
     stl_path: str,
     printer_uuid: str,
     config_ini: str,
     team_id: str = "",
+    auto_continue_dialogs: list[str] | None = None,
     *,
     start_print: bool = True,
 ) -> str:
@@ -580,6 +673,8 @@ async def slice_and_print(
         printer_uuid: Target printer UUID.
         config_ini: Exported PrusaSlicer config bundle (see :func:`slice_stl`).
         team_id: Connect team id (see :func:`upload_gcode`).
+        auto_continue_dialogs: Dialog keys to confirm automatically
+            (see :func:`upload_gcode`). Empty by default.
         start_print: When true (default), START_PRINT after upload.
     """
     try:
@@ -589,7 +684,13 @@ async def slice_and_print(
     except RuntimeError as e:
         return f"Slicing failed: {e}"
 
-    return await upload_gcode(out_path, printer_uuid, team_id=team_id, start_print=start_print)
+    return await upload_gcode(
+        out_path,
+        printer_uuid,
+        team_id=team_id,
+        auto_continue_dialogs=auto_continue_dialogs,
+        start_print=start_print,
+    )
 
 
 # ----------------------------
