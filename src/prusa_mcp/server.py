@@ -312,6 +312,48 @@ async def get_printer_storages(printer_uuid: str) -> str:
     return "\n".join(lines)
 
 
+async def _resolve_printer_file(printer_uuid: str, wanted: str) -> tuple[str | None, str]:
+    """Resolve a file reference to the printer's own path.
+
+    Accepts the printer path (``/usb/CUBE20~1.BGC``), the display path, or the
+    display name (``cube20.bgcode``). Returns ``(path, problem)``; ``path`` is
+    ``None`` when nothing matched or the reference was ambiguous.
+    """
+    data = await make_prusa_request(f"/printers/{printer_uuid}/files?limit=200")
+    if data is None:
+        return None, f"Unable to fetch files for printer {printer_uuid}."
+
+    matches = [
+        entry
+        for entry in data.get("files") or []
+        if wanted in (entry.get("path"), entry.get("display_path"), entry.get("display_name"), entry.get("name"))
+    ]
+    if not matches:
+        return None, f"No file matching {wanted!r} on printer {printer_uuid}."
+    if len(matches) > 1:
+        listed = ", ".join(sorted(str(entry.get("path")) for entry in matches))
+        return None, f"{wanted!r} matches {len(matches)} files ({listed}); pass the exact path instead."
+    return matches[0].get("path"), ""
+
+
+@mcp.tool()
+async def delete_printer_file(printer_uuid: str, path: str) -> str:
+    """Delete a file from a printer's storage. This cannot be undone.
+
+    Args:
+        printer_uuid: The UUID of the printer
+        path: The file to delete, given either as the printer's own path
+            (``/usb/CUBE20~1.BGC``) or as the display name (``cube20.bgcode``).
+            A name matching more than one file is refused rather than guessed at.
+    """
+    resolved, problem = await _resolve_printer_file(printer_uuid, path)
+    if not resolved:
+        return problem
+
+    result = await send_printer_command(printer_uuid, "DELETE_FILE", {"path": resolved})
+    return f"DELETE_FILE {path} -> {resolved}\n{result}"
+
+
 def _tool_sort_key(item: tuple[str, Any]) -> int:
     """Order tools numerically; Connect keys them as strings ("1".."5")."""
     number, _ = item

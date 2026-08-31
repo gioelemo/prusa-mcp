@@ -150,6 +150,14 @@ Get storage devices for a printer.
 |-----------|------|----------|-------------|
 | `printer_uuid` | string | Yes | UUID of the printer |
 
+#### `delete_printer_file`
+Delete a file from a printer's storage. **This cannot be undone.** Accepts either the printer's own path (`/usb/CUBE20~1.BGC`) or the display name (`cube20.bgcode`), resolving the latter against the file list. A name matching more than one file is refused with the candidates listed, rather than guessed at.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `printer_uuid` | string | Yes | UUID of the printer |
+| `path` | string | Yes | Printer path or display name of the file to delete |
+
 #### `get_printer_tools`
 List a printer's tools (extruders): loaded material, nozzle diameter, temperature, and which tool is active. On multi-tool machines like the XL each tool carries a different filament, so this is what tells you which tool to print a given material with. Unloaded tools show as `empty`.
 

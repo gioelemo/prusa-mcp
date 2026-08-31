@@ -273,6 +273,93 @@ def test_format_timestamp_and_duration_survive_junk(bad):
 
 
 # ----------------------------
+# delete_printer_file
+# ----------------------------
+_FILES = [
+    {"display_name": "cube20.bgcode", "name": "cube20.bgcode", "path": "/usb/CUBE20~1.BGC"},
+    {"display_name": "cube20[1].bgcode", "name": "cube20[1].bgcode", "path": "/usb/CUBE20~2.BGC"},
+    {"display_name": "dup.bgcode", "name": "dup.bgcode", "path": "/usb/DUP~1.BGC"},
+    {"display_name": "dup.bgcode", "name": "dup.bgcode", "path": "/usb/ARCHIVE/DUP~2.BGC"},
+]
+
+
+def _patch_files(monkeypatch, files=None):
+    async def fake_req(endpoint):
+        assert "/files" in endpoint
+        return {"files": _FILES if files is None else files}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+
+
+def _capture_commands(monkeypatch) -> dict:
+    captured: dict = {}
+
+    async def fake_cmd(printer_uuid, command, args=None):
+        captured.update(printer_uuid=printer_uuid, command=command, args=args)
+        return "ok"
+
+    monkeypatch.setattr(server, "send_printer_command", fake_cmd)
+    return captured
+
+
+async def test_delete_printer_file_by_display_name(monkeypatch):
+    _patch_files(monkeypatch)
+    captured = _capture_commands(monkeypatch)
+
+    out = await server.delete_printer_file("uuid-1", "cube20.bgcode")
+
+    # Resolved to the printer's 8.3 path, not the name we were given.
+    assert captured == {
+        "printer_uuid": "uuid-1",
+        "command": "DELETE_FILE",
+        "args": {"path": "/usb/CUBE20~1.BGC"},
+    }
+    assert "/usb/CUBE20~1.BGC" in out
+
+
+async def test_delete_printer_file_by_exact_path(monkeypatch):
+    _patch_files(monkeypatch)
+    captured = _capture_commands(monkeypatch)
+
+    await server.delete_printer_file("uuid-1", "/usb/CUBE20~2.BGC")
+    assert captured["args"] == {"path": "/usb/CUBE20~2.BGC"}
+
+
+async def test_delete_printer_file_refuses_ambiguous_name(monkeypatch):
+    """Never guess between two files sharing a name -- deletion is irreversible."""
+    _patch_files(monkeypatch)
+
+    async def boom(*args, **kwargs):
+        raise AssertionError("must not delete on an ambiguous match")
+
+    monkeypatch.setattr(server, "send_printer_command", boom)
+
+    out = await server.delete_printer_file("uuid-1", "dup.bgcode")
+
+    assert "matches 2 files" in out
+    assert "/usb/DUP~1.BGC" in out
+    assert "/usb/ARCHIVE/DUP~2.BGC" in out
+
+
+async def test_delete_printer_file_not_found(monkeypatch):
+    _patch_files(monkeypatch)
+
+    async def boom(*args, **kwargs):
+        raise AssertionError("must not send a command when nothing matched")
+
+    monkeypatch.setattr(server, "send_printer_command", boom)
+    assert "No file matching" in await server.delete_printer_file("uuid-1", "nope.bgcode")
+
+
+async def test_delete_printer_file_request_failed(monkeypatch):
+    async def fake_req(endpoint):
+        return None
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    assert "Unable to fetch files" in await server.delete_printer_file("uuid-1", "cube20.bgcode")
+
+
+# ----------------------------
 # get_printer_tools
 # ----------------------------
 # Shaped like a real Prusa XL: five tools, a different filament in each.
