@@ -15,6 +15,7 @@ MCP server for interacting with Prusa Connect via OAuth2 (Authorization Code + P
 - **File & Storage Management**: Browse printer files and storage devices
 - **Printer Commands**: Send commands directly to printers (pause, resume, temperature, etc.) — see the full [command reference](supported_command.md)
 - **Event Monitoring**: Fetch recent printer events
+- **Multi-tool Support**: Inspect each tool's loaded filament and nozzle on machines like the XL, and slice for a specific tool
 - **Slice & Print**: Slice an STL locally with the PrusaSlicer CLI, then upload and (optionally) print it via the Connect cloud — so the whole pipeline works even on restricted networks where only `connect.prusa3d.com` is reachable and local PrusaLink is blocked
 
 ## Installation
@@ -194,7 +195,12 @@ Upload a sliced g-code/bgcode file to a printer via the Connect cloud, optionall
 | `file_path` | string | Yes | Local path to the `.bgcode`/`.gcode` file |
 | `printer_uuid` | string | Yes | Target printer UUID |
 | `team_id` | string | No | Connect team id (defaults to `PRUSA_TEAM_ID` or auto-discovery) |
+| `auto_continue_dialogs` | list[str] | No | Dialog keys to confirm automatically, e.g. `["UNFINISHED_SELFTEST"]` (default: none) |
 | `start_print` | bool | No | If true, `START_PRINT` the uploaded file (default: false) |
+
+After upload the tool waits for the file to appear on the printer, then starts it using the printer's own path — the printer's storage is FAT-formatted, so `cube.bgcode` becomes something like `/usb/CUBE20~1.BGC`, and re-uploading the same name yields `~2`, so the short name cannot be guessed.
+
+`auto_continue_dialogs` confirms **only** the dialog keys you name. It deliberately offers no "accept anything" mode: the same channel carries filament-runout, thermal-anomaly and crash-detected dialogs, where auto-confirming would turn a stopped printer into a damaged one. Any dialog outside your list is reported and left for a human.
 
 #### `slice_and_print`
 One-shot: slice an STL, upload it, and (by default) start the print.
@@ -205,7 +211,51 @@ One-shot: slice an STL, upload it, and (by default) start the print.
 | `printer_uuid` | string | Yes | Target printer UUID |
 | `config_ini` | string | Yes | Exported PrusaSlicer config bundle |
 | `team_id` | string | No | Connect team id (defaults to `PRUSA_TEAM_ID` or auto-discovery) |
+| `auto_continue_dialogs` | list[str] | No | Dialog keys to confirm automatically (see `upload_gcode`) |
 | `start_print` | bool | No | Start the print after upload (default: true) |
+
+### Printing with a specific tool (multi-tool printers)
+
+On a multi-tool machine like the XL, each tool holds a different filament, so "pick an extruder" really means "pick the tool loaded with the material you want". Start by seeing what's loaded:
+
+```bash
+uv run python -c "
+import asyncio, logging
+logging.disable(logging.INFO)   # hide per-request HTTP logging
+from prusa_mcp import server
+print(asyncio.run(server.get_printer_tools('YOUR-PRINTER-UUID')))
+"
+```
+
+```
+Tool 1: PLA - nozzle 0.4mm - 26.0°C [ACTIVE]
+Tool 2: PVB - nozzle 0.4mm - 28.0°C
+Tool 3: PLA - nozzle 0.4mm - 28.0°C
+Tool 4: FLEX - nozzle 0.4mm - 27.0°C
+Tool 5: PETG - nozzle 0.4mm - 28.0°C
+```
+
+Which tool a print uses is **baked into the g-code at slicing time**, so select it with PrusaSlicer's `--extruder` (1-based), then upload the result:
+
+```bash
+# Slice for tool 3
+/Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer \
+    --load config.ini --extruder 3 --export-gcode \
+    --output cube_tool3.bgcode cube.stl
+
+# Upload and print it
+uv run examples/print_stl.py cube_tool3.bgcode --printer "Printer 1"
+```
+
+Verify the result before sending it: `--extruder 3` should produce `T2` tool-change commands (g-code numbers tools from 0) and `perimeter_extruder = 3` in the config footer. To read a `.bgcode`, re-slice with `--binary-gcode=0` for ASCII output — note the `=`, since `--binary-gcode 0` parses `0` as an input filename.
+
+**Match the filament to the tool.** A bundle configured for PLA sliced onto a PETG tool prints at PLA temperatures on the wrong material. Either target a tool holding the same filament, or override it as well:
+
+```bash
+... --material-profile "Prusament PETG" --extruder 5 ...
+```
+
+`START_PRINT` also accepts an optional `tool_mapping` object for remapping at print time, and `send_printer_command` will forward it. Its exact shape is undocumented and not yet verified here, so slicing for the tool is the supported route.
 
 ## Security Notes
 
