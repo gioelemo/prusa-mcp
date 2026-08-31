@@ -149,6 +149,13 @@ Get storage devices for a printer.
 |-----------|------|----------|-------------|
 | `printer_uuid` | string | Yes | UUID of the printer |
 
+#### `get_printer_tools`
+List a printer's tools (extruders): loaded material, nozzle diameter, temperature, and which tool is active. On multi-tool machines like the XL each tool carries a different filament, so this is what tells you which tool to print a given material with. Unloaded tools show as `empty`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `printer_uuid` | string | Yes | UUID of the printer |
+
 #### `send_printer_command`
 Send a command to a specific printer (e.g., pause, resume, set temperature).
 

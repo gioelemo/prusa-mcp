@@ -306,6 +306,51 @@ async def get_printer_storages(printer_uuid: str) -> str:
     return "\n".join(lines)
 
 
+def _tool_sort_key(item: tuple[str, Any]) -> int:
+    """Order tools numerically; Connect keys them as strings ("1".."5")."""
+    number, _ = item
+    return int(number) if number.isdigit() else 0
+
+
+@mcp.tool()
+async def get_printer_tools(printer_uuid: str) -> str:
+    """Get the tools (extruders) of a printer: loaded material, nozzle and which is active.
+
+    Multi-tool machines such as the XL carry a different filament per tool, so
+    this is what tells you which tool to print a given material with.
+
+    Args:
+        printer_uuid: The UUID of the printer
+    """
+    data = await make_prusa_request(f"/printers/{printer_uuid}")
+    if not data:
+        return f"Unable to fetch tools for printer {printer_uuid}."
+
+    tools = data.get("tools") or {}
+    if not tools:
+        return "This printer reports no per-tool information (single-tool machine)."
+
+    lines: list[str] = []
+    for number, tool in sorted(tools.items(), key=_tool_sort_key):
+        # Connect reports an unloaded tool as the literal "---", not as null.
+        material = (tool.get("material") or "").strip()
+        if not material or material == "---":
+            material = "empty"
+        nozzle = tool.get("nozzle_diameter")
+        temp = tool.get("temp")
+
+        flags = [name for key, name in (("hardened", "hardened"), ("high_flow", "high-flow")) if tool.get(key)]
+        if tool.get("active"):
+            flags.insert(0, "ACTIVE")
+
+        line = f"Tool {number}: {material} - nozzle {nozzle}mm - {temp}°C"
+        if flags:
+            line += f" [{', '.join(flags)}]"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def send_printer_command(printer_uuid: str, command: str, args: dict[str, Any] | None = None) -> str:
     """Send a command to a specific printer.

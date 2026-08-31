@@ -195,6 +195,61 @@ async def test_resolve_team_id_none(monkeypatch):
 
 
 # ----------------------------
+# get_printer_tools
+# ----------------------------
+# Shaped like a real Prusa XL: five tools, a different filament in each.
+_TOOLS = {
+    "1": {"material": "PLA", "nozzle_diameter": 0.4, "temp": 69.0, "active": True},
+    "2": {"material": "PVB", "nozzle_diameter": 0.4, "temp": 27.0},
+    "5": {"material": "PETG", "nozzle_diameter": 0.6, "temp": 28.0, "hardened": True, "high_flow": True},
+}
+
+
+async def test_get_printer_tools_lists_each_tool(monkeypatch):
+    async def fake_req(endpoint):
+        assert endpoint == "/printers/uuid-1"
+        return {"tools": _TOOLS}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+
+    out = await server.get_printer_tools("uuid-1")
+    lines = out.splitlines()
+
+    # Connect keys tools as strings, so they must be ordered numerically.
+    assert [line.split(":")[0] for line in lines] == ["Tool 1", "Tool 2", "Tool 5"]
+    assert "PLA - nozzle 0.4mm - 69.0°C [ACTIVE]" in lines[0]
+    assert lines[1].endswith("27.0°C")  # no flags -> no bracket
+    assert "[hardened, high-flow]" in lines[2]
+
+
+@pytest.mark.parametrize("material", [None, "", "---"])
+async def test_get_printer_tools_reports_empty_slot(monkeypatch, material):
+    """An unloaded tool reads as "---" on a real XL, not as null."""
+
+    async def fake_req(endpoint):
+        return {"tools": {"1": {"material": material, "nozzle_diameter": 0.4, "temp": 25.0}}}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    assert "Tool 1: empty" in await server.get_printer_tools("uuid-1")
+
+
+async def test_get_printer_tools_single_tool_printer(monkeypatch):
+    async def fake_req(endpoint):
+        return {"printer_state": "IDLE"}
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    assert "no per-tool information" in await server.get_printer_tools("uuid-1")
+
+
+async def test_get_printer_tools_request_failed(monkeypatch):
+    async def fake_req(endpoint):
+        return None
+
+    monkeypatch.setattr(server, "make_prusa_request", fake_req)
+    assert "Unable to fetch tools" in await server.get_printer_tools("uuid-1")
+
+
+# ----------------------------
 # upload_gcode
 # ----------------------------
 async def test_upload_gcode_registers_and_puts(monkeypatch, bgcode_file):
