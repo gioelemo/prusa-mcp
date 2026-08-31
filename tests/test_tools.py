@@ -458,6 +458,46 @@ async def test_upload_gcode_start_print(monkeypatch, bgcode_file):
     assert "Command 'START_PRINT' sent successfully" in msg
 
 
+async def test_upload_gcode_start_print_with_tool_mapping(monkeypatch, bgcode_file):
+    """Keys are the g-code's tools, values the physical tools; both 1-based.
+
+    Derived from Prusa-Firmware-Buddy: command.cpp parses tool_mapping as an
+    object of numeric keys to arrays, converting both with -1 ("internally tools
+    are numbered from 0, externally from 1"), and marlin_printer.cpp applies it
+    as set_mapping(gcode_tool, virtual_tool).
+    """
+    _patch_httpx(monkeypatch)
+    monkeypatch.setattr(server, "_auth_headers", _fake_auth_headers)
+    monkeypatch.setattr(server, "make_prusa_request", _fake_files_listing)
+    captured: dict = {}
+
+    async def fake_cmd(printer_uuid, command, args=None):
+        captured.update(command=command, args=args)
+        return "started"
+
+    monkeypatch.setattr(server, "send_printer_command", fake_cmd)
+
+    await server.upload_gcode(str(bgcode_file), "uuid-2", team_id="t1", tool_mapping={"1": [3]}, start_print=True)
+
+    assert captured["args"] == {"path": "/usb/MODEL~1.BGC", "tool_mapping": {"1": [3]}}
+
+
+async def test_upload_gcode_omits_tool_mapping_when_unset(monkeypatch, bgcode_file):
+    _patch_httpx(monkeypatch)
+    monkeypatch.setattr(server, "_auth_headers", _fake_auth_headers)
+    monkeypatch.setattr(server, "make_prusa_request", _fake_files_listing)
+    captured: dict = {}
+
+    async def fake_cmd(printer_uuid, command, args=None):
+        captured.update(args=args)
+        return "started"
+
+    monkeypatch.setattr(server, "send_printer_command", fake_cmd)
+
+    await server.upload_gcode(str(bgcode_file), "uuid-2", team_id="t1", start_print=True)
+    assert captured["args"] == {"path": "/usb/MODEL~1.BGC"}
+
+
 async def test_send_printer_command_sends_kwargs_not_args(monkeypatch):
     """Connect rejects ``args`` with MISSING_COMMAND_ARGUMENT; it requires ``kwargs``."""
     rec = _patch_httpx(monkeypatch)

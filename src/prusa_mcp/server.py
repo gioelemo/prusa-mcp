@@ -674,7 +674,12 @@ async def _auto_continue_dialog(printer_uuid: str, allowed_keys: set[str]) -> st
         await asyncio.sleep(DIALOG_POLL_INTERVAL_SECONDS)
 
 
-async def _start_uploaded_print(printer_uuid: str, name: str, auto_continue_dialogs: list[str] | None = None) -> str:
+async def _start_uploaded_print(
+    printer_uuid: str,
+    name: str,
+    auto_continue_dialogs: list[str] | None = None,
+    tool_mapping: dict[str, list[int]] | None = None,
+) -> str:
     """START_PRINT a freshly uploaded file once it lands, clearing allowed dialogs."""
     printer_path = await _wait_for_printer_file(printer_uuid, name)
     if not printer_path:
@@ -683,7 +688,11 @@ async def _start_uploaded_print(printer_uuid: str, name: str, auto_continue_dial
             f"{FILE_APPEAR_TIMEOUT_SECONDS:.0f}s; cannot START_PRINT automatically."
         )
 
-    result = await send_printer_command(printer_uuid, "START_PRINT", {"path": printer_path})
+    args: dict[str, Any] = {"path": printer_path}
+    if tool_mapping:
+        args["tool_mapping"] = tool_mapping
+
+    result = await send_printer_command(printer_uuid, "START_PRINT", args)
     if auto_continue_dialogs:
         dialog_msg = await _auto_continue_dialog(printer_uuid, set(auto_continue_dialogs))
         if dialog_msg:
@@ -692,12 +701,13 @@ async def _start_uploaded_print(printer_uuid: str, name: str, auto_continue_dial
 
 
 @mcp.tool()
-async def upload_gcode(
+async def upload_gcode(  # noqa: PLR0913
     file_path: str,
     printer_uuid: str,
     team_id: str = "",
-    auto_continue_dialogs: list[str] | None = None,
     *,
+    auto_continue_dialogs: list[str] | None = None,
+    tool_mapping: dict[str, list[int]] | None = None,
     start_print: bool = False,
 ) -> str:
     """Upload a sliced g-code/bgcode file to a printer via the Prusa Connect cloud.
@@ -716,6 +726,11 @@ async def upload_gcode(
             only keys named here are confirmed, because the same channel carries
             filament-runout, thermal-anomaly and crash-detected dialogs that must
             be seen by a human. Any other dialog is reported and left alone.
+        tool_mapping: Remap the tools a multi-tool g-code asks for onto the
+            printer's physical tools, e.g. ``{"1": [3]}`` to run a file authored
+            for tool 1 on tool 3. Both sides are 1-based. Extra entries in a list
+            are spool-join fallbacks. The printer *replaces* its whole mapping
+            rather than merging, so map every tool the file uses, not just one.
         start_print: When true, issue START_PRINT for the uploaded file.
     """
     tid = await _resolve_team_id(printer_uuid, team_id)
@@ -742,7 +757,7 @@ async def upload_gcode(
 
     msg = f"Uploaded {name} -> {info.get('path')} (state={info.get('state')}, id={info.get('id')})."
     if start_print:
-        msg = f"{msg}\n{await _start_uploaded_print(printer_uuid, name, auto_continue_dialogs)}"
+        msg = f"{msg}\n{await _start_uploaded_print(printer_uuid, name, auto_continue_dialogs, tool_mapping)}"
     return msg
 
 
@@ -752,8 +767,9 @@ async def slice_and_print(  # noqa: PLR0913
     printer_uuid: str,
     config_ini: str,
     team_id: str = "",
-    auto_continue_dialogs: list[str] | None = None,
     *,
+    auto_continue_dialogs: list[str] | None = None,
+    tool_mapping: dict[str, list[int]] | None = None,
     start_print: bool = True,
 ) -> str:
     """One-shot: slice an STL locally, upload it to Connect, and optionally print.
@@ -768,6 +784,8 @@ async def slice_and_print(  # noqa: PLR0913
         team_id: Connect team id (see :func:`upload_gcode`).
         auto_continue_dialogs: Dialog keys to confirm automatically
             (see :func:`upload_gcode`). Empty by default.
+        tool_mapping: Remap g-code tools onto physical tools
+            (see :func:`upload_gcode`).
         start_print: When true (default), START_PRINT after upload.
     """
     try:
@@ -782,6 +800,7 @@ async def slice_and_print(  # noqa: PLR0913
         printer_uuid,
         team_id=team_id,
         auto_continue_dialogs=auto_continue_dialogs,
+        tool_mapping=tool_mapping,
         start_print=start_print,
     )
 

@@ -204,6 +204,7 @@ Upload a sliced g-code/bgcode file to a printer via the Connect cloud, optionall
 | `printer_uuid` | string | Yes | Target printer UUID |
 | `team_id` | string | No | Connect team id (defaults to `PRUSA_TEAM_ID` or auto-discovery) |
 | `auto_continue_dialogs` | list[str] | No | Dialog keys to confirm automatically, e.g. `["UNFINISHED_SELFTEST"]` (default: none) |
+| `tool_mapping` | object | No | Remap g-code tools onto physical tools, e.g. `{"1": [3]}` (see below) |
 | `start_print` | bool | No | If true, `START_PRINT` the uploaded file (default: false) |
 
 After upload the tool waits for the file to appear on the printer, then starts it using the printer's own path — the printer's storage is FAT-formatted, so `cube.bgcode` becomes something like `/usb/CUBE20~1.BGC`, and re-uploading the same name yields `~2`, so the short name cannot be guessed.
@@ -220,6 +221,7 @@ One-shot: slice an STL, upload it, and (by default) start the print.
 | `config_ini` | string | Yes | Exported PrusaSlicer config bundle |
 | `team_id` | string | No | Connect team id (defaults to `PRUSA_TEAM_ID` or auto-discovery) |
 | `auto_continue_dialogs` | list[str] | No | Dialog keys to confirm automatically (see `upload_gcode`) |
+| `tool_mapping` | object | No | Remap g-code tools onto physical tools, e.g. `{"1": [3]}` (see below) |
 | `start_print` | bool | No | Start the print after upload (default: true) |
 
 ### Printing with a specific tool (multi-tool printers)
@@ -263,7 +265,20 @@ Verify the result before sending it: `--extruder 3` should produce `T2` tool-cha
 ... --material-profile "Prusament PETG" --extruder 5 ...
 ```
 
-`START_PRINT` also accepts an optional `tool_mapping` object for remapping at print time, and `send_printer_command` will forward it. Its exact shape is undocumented and not yet verified here, so slicing for the tool is the supported route.
+#### Remapping at print time
+
+`upload_gcode` and `slice_and_print` also take `tool_mapping`, which retargets a file without re-slicing it. Keys are the tools the **g-code** asks for, values are the **physical** tools to use, and both sides are 1-based:
+
+```jsonc
+{"1": [3]}          // g-code written for tool 1 → print it with tool 3
+{"1": [3], "2": [5]} // a two-tool file remapped onto tools 3 and 5
+```
+
+Extra entries in a list are spool-join fallbacks (`{"1": [3, 4]}` continues on tool 4 when 3 runs out).
+
+Two caveats. The printer **replaces** its entire mapping rather than merging, so map every tool the file uses — a tool you leave out is left unassigned, not left alone. And Connect validates the file path *before* the mapping, so a malformed mapping isn't reported by the API; it surfaces on the printer.
+
+This shape is not in Prusa's public API docs. It was read off the firmware: [`command.cpp`](https://github.com/prusa3d/Prusa-Firmware-Buddy/blob/master/src/connect/command.cpp) parses `tool_mapping` as an object of numeric keys to arrays and converts both with `-1` ("internally tools are numbered from 0, externally from 1"), and [`marlin_printer.cpp`](https://github.com/prusa3d/Prusa-Firmware-Buddy/blob/master/src/connect/marlin_printer.cpp) applies it as `set_mapping(gcode_tool, virtual_tool)`.
 
 ## Security Notes
 
