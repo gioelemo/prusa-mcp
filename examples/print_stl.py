@@ -47,6 +47,25 @@ AUTO_CONTINUE_KEYS = ["UNFINISHED_SELFTEST"]
 SLICEABLE = {".stl", ".3mf", ".obj"}
 PRINTABLE = {".gcode", ".bgcode"}
 
+# The MCP tools report problems as text rather than raising, so a shell caller
+# has to classify the result to get a meaningful exit status out of it.
+FAILURE_MARKERS = (
+    "failed",
+    "not found",
+    "not authenticated",
+    "unable to",
+    "could not",
+    "cannot",
+    "has not appeared",
+    "no file matching",
+)
+
+
+def looks_like_failure(result: str) -> bool:
+    """True when a tool's text result reports a problem rather than success."""
+    lowered = result.lower()
+    return any(marker in lowered for marker in FAILURE_MARKERS)
+
 
 def describe(printer: dict) -> str:
     """Render one printer as a short two-line block."""
@@ -181,6 +200,10 @@ async def main() -> int:
         )
 
     print(result)
+    if looks_like_failure(result):
+        print("\nThe operation reported a failure; not starting or reporting a job.", file=sys.stderr)
+        return 1
+
     if start:
         await report_job(uuid)
     return 0

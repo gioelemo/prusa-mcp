@@ -18,7 +18,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx2
 from mcp.server.mcpserver import MCPServer  # type: ignore[import-not-found]
@@ -60,6 +60,9 @@ FILE_POLL_INTERVAL_SECONDS = 2.0
 # A blocking dialog shows up a moment after START_PRINT, not instantly.
 DIALOG_WAIT_SECONDS = 15.0
 DIALOG_POLL_INTERVAL_SECONDS = 1.5
+
+# Binary G-code files start with this; ASCII ones begin with a comment.
+BGCODE_MAGIC = b"GCDE"
 
 
 # ----------------------------
@@ -513,7 +516,11 @@ def _slice_to_gcode(stl_path: str, config_ini: str, output_path: str = "") -> tu
         raise FileNotFoundError(f"STL not found: {stl}")
     if not cfg.is_file():
         raise FileNotFoundError(f"Config bundle not found: {cfg}")
-    out = Path(output_path).expanduser() if output_path else stl.with_suffix(".bgcode")
+    # The profile, not the filename, decides the encoding: PrusaSlicer honours
+    # --output verbatim, so defaulting to .bgcode against a profile with
+    # binary_gcode = 0 yields ASCII G-code wearing a .bgcode suffix, which the
+    # printer can refuse. Take the default extension from the profile instead.
+    out = Path(output_path).expanduser() if output_path else stl.with_suffix(_config_gcode_suffix(cfg))
 
     cli = shutil.which(PRUSASLICER_CLI) or PRUSASLICER_CLI
     cmd = [cli, "--load", str(cfg), "--export-gcode", "--output", str(out), str(stl)]
@@ -532,7 +539,32 @@ def _slice_to_gcode(stl_path: str, config_ini: str, output_path: str = "") -> tu
             f"Slicer reported success but produced no file at {out}; "
             f"check the profile's output/extension settings. {proc.stdout.strip()}"
         )
+
+    # Trust the bytes over the filename, including when the caller chose the name.
+    actual_binary = out.read_bytes()[:4] == BGCODE_MAGIC
+    if actual_binary != (out.suffix.lower() == ".bgcode"):
+        produced, expected = ("binary", ".bgcode") if actual_binary else ("ASCII", ".gcode")
+        raise RuntimeError(
+            f"{out.name} contains {produced} G-code but is named {out.suffix}; the printer may "
+            f"reject it. Rename it to {expected}, or flip binary_gcode in the profile to match."
+        )
     return str(out), out.stat().st_size, stl.name
+
+
+def _config_gcode_suffix(config_ini: Path) -> str:
+    """Return ``.bgcode`` or ``.gcode`` according to the profile's ``binary_gcode``.
+
+    The bundle is a flat ``key = value`` ini; PrusaSlicer omits the key on
+    profiles that predate binary G-code, where the answer is ASCII.
+    """
+    try:
+        for line in config_ini.read_text(errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "binary_gcode":
+                return ".bgcode" if value.strip() == "1" else ".gcode"
+    except OSError:
+        logger.debug("Could not read %s to determine gcode encoding", config_ini)
+    return ".gcode"
 
 
 def _read_file(file_path: str) -> tuple[str, int, bytes]:
@@ -619,26 +651,52 @@ async def slice_stl(stl_path: str, config_ini: str, output_path: str = "") -> st
     return f"Sliced {stl_name} -> {out_path} ({size} bytes)"
 
 
+async def _printer_file_paths(printer_uuid: str) -> frozenset[str]:
+    """Snapshot the paths currently on the printer, to spot what an upload adds."""
+    data = await make_prusa_request(f"/printers/{printer_uuid}/files?limit=200")
+    return frozenset(entry["path"] for entry in (data or {}).get("files") or [] if entry.get("path"))
+
+
 async def _wait_for_printer_file(
-    printer_uuid: str, name: str, timeout_seconds: float = FILE_APPEAR_TIMEOUT_SECONDS
+    printer_uuid: str,
+    *,
+    size: int | None = None,
+    exclude_paths: frozenset[str] = frozenset(),
+    since: float = 0.0,
+    timeout_seconds: float = FILE_APPEAR_TIMEOUT_SECONDS,
 ) -> str | None:
-    """Wait for an uploaded file to land on the printer, returning its real path.
+    """Wait for a just-uploaded file to land on the printer, returning its real path.
 
-    Two things make the upload response's ``path`` unusable for START_PRINT: the
-    transfer to the printer is not instant, and the printer's FAT storage
-    addresses files by 8.3 short name (``/usb/CUBE20~1.BGC``) while Connect
-    reports the long name (``/usb/cube20.bgcode``). Polling the printer's own
-    file list solves both — the ``path`` field there is what START_PRINT
-    resolves, and its presence proves the transfer finished.
+    The upload response's ``path`` is unusable for START_PRINT: the transfer is
+    not instant, and the printer's FAT storage addresses files by 8.3 short name
+    (``/usb/CUBE20~1.BGC``) while Connect reports the long one. Polling the
+    printer's own file list solves both — its ``path`` is what START_PRINT
+    resolves, and the entry's presence proves the transfer finished.
 
-    Returns ``None`` if the file has not appeared before ``timeout_seconds``.
+    Matching by *name* would be wrong. Uploading a name that already exists makes
+    Connect store the new copy under a different one (``cube20.bgcode`` becomes
+    ``cube20[1].bgcode``), so a name match finds the stale file and START_PRINT
+    runs the previous upload. Identify the new file by what changed instead: a
+    path that was not there before, or an entry modified since the upload began,
+    preferring the newest and requiring the size to match when known.
+
+    Returns ``None`` if nothing matching appeared before ``timeout_seconds`` —
+    deliberately, since printing a stale file is worse than not printing.
     """
     deadline = time.monotonic() + timeout_seconds
     while True:
         data = await make_prusa_request(f"/printers/{printer_uuid}/files?limit=200")
-        for entry in (data or {}).get("files") or []:
-            if name in (entry.get("display_name"), entry.get("name")):
-                return entry.get("path") or entry.get("display_path")
+
+        candidates = [
+            entry
+            for entry in (data or {}).get("files") or []
+            if entry.get("path")
+            and (entry["path"] not in exclude_paths or (entry.get("m_timestamp") or 0) >= since)
+            and (size is None or entry.get("size") == size)
+        ]
+        if candidates:
+            return max(candidates, key=lambda entry: entry.get("m_timestamp") or 0)["path"]
+
         if time.monotonic() >= deadline:
             return None
         await asyncio.sleep(FILE_POLL_INTERVAL_SECONDS)
@@ -674,18 +732,37 @@ async def _auto_continue_dialog(printer_uuid: str, allowed_keys: set[str]) -> st
         await asyncio.sleep(DIALOG_POLL_INTERVAL_SECONDS)
 
 
+class _Upload(NamedTuple):
+    """What identifies a freshly uploaded file on the printer afterwards.
+
+    Connect renames a colliding filename, so the name is not a reliable handle;
+    what the upload *added* to the printer's file list is.
+    """
+
+    size: int
+    paths_before: frozenset[str]
+    started_at: float
+
+
 async def _start_uploaded_print(
     printer_uuid: str,
-    name: str,
+    upload: _Upload,
+    *,
     auto_continue_dialogs: list[str] | None = None,
     tool_mapping: dict[str, list[int]] | None = None,
 ) -> str:
     """START_PRINT a freshly uploaded file once it lands, clearing allowed dialogs."""
-    printer_path = await _wait_for_printer_file(printer_uuid, name)
+    printer_path = await _wait_for_printer_file(
+        printer_uuid,
+        size=upload.size,
+        exclude_paths=upload.paths_before,
+        since=upload.started_at,
+    )
     if not printer_path:
         return (
-            f"File has not appeared on the printer within "
-            f"{FILE_APPEAR_TIMEOUT_SECONDS:.0f}s; cannot START_PRINT automatically."
+            f"The uploaded file has not appeared on the printer within "
+            f"{FILE_APPEAR_TIMEOUT_SECONDS:.0f}s; not starting a print, since the only "
+            f"other candidate would be an older file of the same name."
         )
 
     args: dict[str, Any] = {"path": printer_path}
@@ -745,6 +822,11 @@ async def upload_gcode(  # noqa: PLR0913
     except FileNotFoundError as e:
         return str(e)
 
+    # Snapshot the printer's files first: it is what the upload *adds* that
+    # identifies it afterwards, since Connect renames a colliding name.
+    before = await _printer_file_paths(printer_uuid) if start_print else frozenset()
+    since = time.time()
+
     try:
         info = await _upload_bytes(name, size, data, tid, printer_uuid)
     except LoginRequired as e:
@@ -757,7 +839,13 @@ async def upload_gcode(  # noqa: PLR0913
 
     msg = f"Uploaded {name} -> {info.get('path')} (state={info.get('state')}, id={info.get('id')})."
     if start_print:
-        msg = f"{msg}\n{await _start_uploaded_print(printer_uuid, name, auto_continue_dialogs, tool_mapping)}"
+        started = await _start_uploaded_print(
+            printer_uuid,
+            _Upload(size=size, paths_before=before, started_at=since),
+            auto_continue_dialogs=auto_continue_dialogs,
+            tool_mapping=tool_mapping,
+        )
+        msg = f"{msg}\n{started}"
     return msg
 
 

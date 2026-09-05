@@ -193,7 +193,9 @@ Slice a local STL into g-code/bgcode with the PrusaSlicer CLI. Runs entirely on 
 |-----------|------|----------|-------------|
 | `stl_path` | string | Yes | Path to the input `.stl` |
 | `config_ini` | string | Yes | Exported PrusaSlicer config bundle (File → Export → Export Config) |
-| `output_path` | string | No | Output file (default: STL name with a `.bgcode` extension) |
+| `output_path` | string | No | Output file (default: STL name with `.bgcode` or `.gcode`, following the profile's `binary_gcode`) |
+
+The default extension follows the profile rather than being fixed, because PrusaSlicer takes the *encoding* from `binary_gcode` but the *filename* from `--output` — so a fixed `.bgcode` against an ASCII profile produces a mislabelled file the printer may reject. Whatever the name, the result is checked against its actual magic bytes and slicing fails on a mismatch.
 
 #### `upload_gcode`
 Upload a sliced g-code/bgcode file to a printer via the Connect cloud, optionally starting the print.
