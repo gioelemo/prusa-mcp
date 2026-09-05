@@ -35,6 +35,8 @@ dev = [
   # are still needed.
   "ruff==0.16.1",
   "pre-commit",
+  "pytest",
+  "pytest-asyncio",
 ]
 
 [tool.ruff]
@@ -108,6 +110,7 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "*/__init__.py" = ["F401", "D104", "E402"]
+"tests/*" = ["S101", "D100", "D103", "PLR2004", "SLF001", "INP001", "ARG001", "ARG002"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -138,3 +141,8 @@ module = [
     "webview",
 ]
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
